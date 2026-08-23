@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from v8help import __version__
-from v8help.config import Config
+from v8help.config import Config, discover_platforms
 from v8help.db import Database
 from v8help.jobs import get_manager
 from v8help.search.fts import FtsBackend
@@ -136,6 +136,15 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["job_id"],
         },
+    },
+    {
+        "name": "discover",
+        "description": (
+            "Показать конфиг и автодискавери: каталог bin установленной платформы "
+            "1С (реестр Uninstall/ФС) и состояние индекса. В перспективе — доступные "
+            "LLM на localhost-портах."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
@@ -339,14 +348,50 @@ class McpServer:
         force = bool(args.get("force", False))
         cleanup = args.get("cleanup")
         cleanup = bool(cleanup) if cleanup is not None else None
+        bin_dir = ""
+        if not cfg.sources:
+            bin_dir = str(cfg.resolve_bin_dir() or "")
+            if bin_dir in ("", "."):
+                raise RuntimeError(
+                    "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
+                    "конфиге или проверьте установку платформы 1С."
+                )
         job = get_manager().start(cfg, force=force, cleanup=cleanup)
-        return {"job_id": job.id, "status": "started"}
+        return {"job_id": job.id, "status": "started", "bin_dir": bin_dir}
 
     def _tool_build_status(self, args: dict) -> dict:
         job = get_manager().status(str(args["job_id"]))
         if job is None:
             raise KeyError(f"Job не найден: {args['job_id']}")
         return job.as_dict()
+
+    def _tool_discover(self, args: dict) -> dict:
+        db = Database(self.db_path)
+        index: dict = {"exists": db.exists()}
+        if db.exists():
+            conn = db.connect()
+            try:
+                meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+                pages = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+                links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+            finally:
+                conn.close()
+            index.update({"pages": pages, "links": links, "meta": meta})
+        bd = self.config.resolve_bin_dir()
+        bin_dir = str(bd) if str(bd) not in ("", ".") else ""
+        return {
+            "bin_dir": bin_dir,
+            "bin_dir_explicit": str(self.config.bin_dir) not in ("", "."),
+            "platforms": discover_platforms(),
+            "config": {
+                "db_path": str(self.config.db_path),
+                "corpus_dir": str(self.config.corpus_dir),
+                "books": self.config.books,
+                "lang": self.config.lang,
+                "search": dataclasses.asdict(self.config.search),
+            },
+            "index": index,
+        }
 
 
 _TOOL_HANDLERS = {
@@ -356,6 +401,7 @@ _TOOL_HANDLERS = {
     "related": McpServer._tool_related,
     "build": McpServer._tool_build,
     "build_status": McpServer._tool_build_status,
+    "discover": McpServer._tool_discover,
 }
 
 
@@ -409,7 +455,14 @@ def main(argv: list[str] | None = None) -> int:
         i = argv.index("--config")
         if i + 1 < len(argv):
             config_path = argv[i + 1]
-    config = Config.load(config_path)
+    config: Config | None = None
+    if config_path:
+        try:
+            config = Config.load(config_path)
+        except FileNotFoundError:
+            print(f"[v8help] config не найден: {config_path} — использую defaults", file=sys.stderr)
+    if config is None:
+        config = Config()
     base = Path(config_path).resolve().parent if config_path else PROJECT_ROOT
     return run(_resolve_paths(config, base))
 

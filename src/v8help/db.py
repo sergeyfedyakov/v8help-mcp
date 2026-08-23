@@ -24,9 +24,8 @@ CREATE TABLE IF NOT EXISTS pages (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
-    search_text,
-    content='pages',
-    content_rowid='id',
+    title,
+    body,
     tokenize='unicode61'
 );
 
@@ -80,17 +79,19 @@ class Database:
         hbk_source: str,
         source_path: str,
         body: str,
-        search_text: str,
+        title_search: str,
+        body_search: str,
     ) -> int:
         cur = conn.execute(
             "INSERT INTO pages(filename,title,section,kind,hbk_source,source_path,body,search_text)"
             " VALUES(?,?,?,?,?,?,?,?)",
-            (filename, title, section, kind, hbk_source, source_path, body, search_text),
+            (filename, title, section, kind, hbk_source, source_path, body,
+             title_search + "\n" + body_search),
         )
         rowid = cur.lastrowid
         conn.execute(
-            "INSERT INTO pages_fts(rowid, search_text) VALUES(?,?)",
-            (rowid, search_text),
+            "INSERT INTO pages_fts(rowid, title, body) VALUES(?,?,?)",
+            (rowid, title_search, body_search),
         )
         return rowid
 

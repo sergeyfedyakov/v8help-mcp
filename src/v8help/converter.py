@@ -474,6 +474,7 @@ class HbkConverter:
         produced: list[Path] = []
         pages = list(iter_html(extracted_dir))
         total = len(pages)
+        report_every = max(1, min(500, total // 10)) if total else 1
         for i, html_path in enumerate(pages):
             rel = html_path.relative_to(extracted_dir).as_posix()
             self.stats.total += 1
@@ -483,7 +484,8 @@ class HbkConverter:
                 produced.append(self.out_dir / name)
             except Exception:
                 self.stats.failed += 1
-            self._emit("convert", f"{src.id}: {i + 1}/{total}")
+            if (i + 1) % report_every == 0 or (i + 1) == total:
+                self._emit("convert", f"{src.id}: {i + 1}/{total}")
         return produced
 
     def _convert_one(

@@ -36,6 +36,7 @@ class Job:
             "sources": r.sources if r else None,
             "duration_sec": r.duration_sec if r else None,
             "db_path": r.db_path if r else None,
+            "bin_dir": r.bin_dir if r else None,
             "error": self.error or None,
         }
 

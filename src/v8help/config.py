@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,18 +115,32 @@ class Config:
         )
         return cfg
 
+    def resolve_bin_dir(self) -> Path:
+        """Каталог bin платформы: явный ``bin_dir`` либо автодискавери (реестр/ФС)."""
+        if str(self.bin_dir) not in ("", "."):
+            return self.bin_dir
+        return discover_bin_dir() or Path("")
+
     def resolve_sources(self, lang: str | None = None) -> list[SourceSpec]:
         """Источники для сборки: явный [[sources]] либо books+bin_dir (shorthand)."""
         lang = lang or self.lang
         if self.sources:
             return [s for s in self.sources if s.lang == lang]
+        if not self.books:
+            return []
+        bin_dir = self.resolve_bin_dir()
+        if str(bin_dir) in ("", "."):
+            raise RuntimeError(
+                "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
+                "конфиге или проверьте установку платформы 1С (реестр Uninstall)."
+            )
         out: list[SourceSpec] = []
         for book in self.books:
             prefix, scheme = _book_meta(book)
             out.append(
                 SourceSpec(
                     id=book,
-                    hbk=self.bin_dir / f"{book}.hbk",
+                    hbk=bin_dir / f"{book}.hbk",
                     prefix=prefix,
                     scheme=scheme,
                     lang=_book_lang(book, lang),
@@ -157,3 +173,179 @@ def _book_lang(book: str, default: str) -> str:
     if book.endswith(("_root", "_en")):
         return "en"
     return default
+
+
+# ---------- Автодискавери каталога bin платформы 1С ------------------------
+
+_VERSION_RE = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?")
+
+
+def _parse_version(s: str) -> tuple[int, ...] | None:
+    """'8.5.1.1423' -> (8, 5, 1, 1423); None если версию не выделить."""
+    if not s:
+        return None
+    m = _VERSION_RE.search(s)
+    if not m:
+        return None
+    parts = tuple(int(x) for x in m.groups() if x is not None)
+    return parts or None
+
+
+_VERSION_DOTTED_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
+
+def _parse_dotted_version(s: str) -> tuple[int, ...] | None:
+    """Версия x.y[.z[.w]] из произвольной строки (не цепляет «1» в «1C»).
+
+    Берёт самое длинное точечное число (например из «… 8.2 (8.2.19.130)» → 8.2.19.130).
+    """
+    if not s:
+        return None
+    best: tuple[int, ...] | None = None
+    for m in _VERSION_DOTTED_RE.finditer(s):
+        parts = tuple(int(x) for x in m.groups() if x is not None)
+        if parts and (best is None or len(parts) > len(best)):
+            best = parts
+    return best
+
+
+def _is_1c_platform(display_name: str) -> bool:
+    """«1С:Предприятие» или английская локализация «1C:Enterprise 8»."""
+    if not display_name:
+        return False
+    low = display_name.casefold()
+    if "предприятие" in low:
+        return True
+    return "enterprise" in low and ("1c" in low or "1с" in low)
+
+
+def _reg_str(key, name: str) -> str:
+    try:
+        import winreg
+
+        val, _ = winreg.QueryValueEx(key, name)
+        return str(val) if val else ""
+    except OSError:
+        return ""
+
+
+def _registry_1c_installs() -> list[tuple[tuple[int, ...], Path]]:
+    """Установки «1С:Предприятие» из реестра Uninstall (HKLM/WOW6432Node/HKCU)."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    out: list[tuple[tuple[int, ...], Path]] = []
+    for hive, sub in roots:
+        try:
+            key = winreg.OpenKey(hive, sub)
+        except OSError:
+            continue
+        with key:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(key, name) as sk:
+                        dn = _reg_str(sk, "DisplayName")
+                        ver = _reg_str(sk, "DisplayVersion")
+                        loc = _reg_str(sk, "InstallLocation")
+                except OSError:
+                    continue
+                if not _is_1c_platform(dn):
+                    continue
+                v = _parse_version(ver) or _parse_dotted_version(dn)
+                if v is None or not loc:
+                    continue
+                out.append((v, Path(loc)))
+    return out
+
+
+def _fs_platform_bin_dirs() -> list[tuple[tuple[int, ...], Path]]:
+    """Fallback: сканируем %ProgramFiles%\\1cv8\\<version> на случай портативной установки."""
+    out: list[tuple[tuple[int, ...], Path]] = []
+    for env in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+        root = os.environ.get(env)
+        if not root:
+            continue
+        base = Path(root) / "1cv8"
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
+            if not child.is_dir():
+                continue
+            v = _parse_version(child.name)
+            if v is None:
+                continue
+            out.append((v, child))
+    return out
+
+
+def _bin_dir_for(loc: Path) -> Path | None:
+    """InstallLocation может указывать на корень версии (…\\8.5.1.1423\\) или сразу на bin."""
+    for cand in (loc / "bin", loc):
+        try:
+            if cand.is_dir() and any(cand.glob("*.hbk")):
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _collect_platforms() -> list[tuple[tuple[int, ...], Path]]:
+    """Все bin-каталоги платформы с .hbk, по убыванию версии."""
+    candidates = _registry_1c_installs()
+    fs = _fs_platform_bin_dirs()
+    seen = {p for _, p in candidates}
+    for v, p in fs:
+        if p not in seen:
+            candidates.append((v, p))
+    resolved: list[tuple[tuple[int, ...], Path]] = []
+    seen_bin: set[Path] = set()
+    for v, loc in sorted(candidates, key=lambda x: x[0], reverse=True):
+        bd = _bin_dir_for(loc)
+        if bd is None or bd in seen_bin:
+            continue
+        seen_bin.add(bd)
+        resolved.append((v, bd))
+    return resolved
+
+
+def discover_platforms() -> list[dict]:
+    """Все найденные платформы: [{version, bin_dir}], по убыванию версии."""
+    return [
+        {"version": ".".join(map(str, v)), "bin_dir": str(bd)}
+        for v, bd in _collect_platforms()
+    ]
+
+
+_bin_dir_cache: tuple[bool, Path | None] = (False, None)
+
+
+def discover_bin_dir() -> Path | None:
+    """Каталог bin самой свежей установленной платформы 1С (или None)."""
+    global _bin_dir_cache
+    done, val = _bin_dir_cache
+    if done:
+        return val
+    plats = _collect_platforms()
+    val = plats[0][1] if plats else None
+    _bin_dir_cache = (True, val)
+    return val
+
+
+def reset_discovery_cache() -> None:
+    global _bin_dir_cache
+    _bin_dir_cache = (False, None)

@@ -65,7 +65,20 @@ def test_tools_list(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
     )
     names = {t["name"] for t in resp["result"]["tools"]}
-    assert names == {"search", "get_page", "hierarchy", "related", "build", "build_status"}
+    assert names == {
+        "search", "get_page", "hierarchy", "related", "build", "build_status", "discover"
+    }
+
+
+def test_tool_discover(tmp_path):
+    server = McpServer(_build_tiny_index(tmp_path))
+    resp = _call(server, 20, "discover", {})
+    data = _result_payload(resp)
+    assert data["index"]["exists"] is True
+    assert data["index"]["pages"] == 3
+    assert "bin_dir" in data
+    assert "platforms" in data
+    assert data["config"]["books"] == []
 
 
 def _call(server, iid, name, arguments=None):

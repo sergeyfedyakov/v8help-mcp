@@ -30,6 +30,7 @@ class BuildResult:
     sources: int = 0
     duration_sec: float = 0.0
     db_path: str = ""
+    bin_dir: str = ""
 
 
 def _is_up_to_date(config: Config) -> bool:
@@ -73,8 +74,12 @@ def _index_corpus(config: Config, db_path: Path, files: list[Path]) -> tuple[int
             section = metadata.detect_section(name)
             kind = metadata.detect_kind(name)
             source = metadata.detect_source(name)
-            search_text = lex.expand(title + "\n" + text)
-            db.insert_page(conn, name, title, section, kind, source, "", text, search_text)
+            title_search = lex.expand(title)
+            body_search = lex.expand(text)
+            db.insert_page(
+                conn, name, title, section, kind, source, "", text,
+                title_search, body_search,
+            )
             dsts = [d for d in metadata.parse_links(text) if d in filenames and d != name]
             db.insert_links(conn, name, dsts)
             links_total += len(dsts)
@@ -104,7 +109,12 @@ def run_build(
     started = time.time()
     emit = on_progress or (lambda stage, msg: None)
     sources = config.resolve_sources()
-    result = BuildResult(sources=len(sources), db_path=str(config.db_path))
+    bd = config.resolve_bin_dir()
+    result = BuildResult(
+        sources=len(sources),
+        db_path=str(config.db_path),
+        bin_dir=str(bd) if str(bd) not in ("", ".") else "",
+    )
 
     if not force and _is_up_to_date(config):
         result.skipped = True
