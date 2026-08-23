@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Тесты и линтеры
+.pytest_cache/
+.ruff_cache/
+
+# Собранные данные: индекс, markdown-корпус, распакованные .hbk
+data/
+
+# Локальные/персональные каталоги (не для публикации)
+.ai/
+.kilo/
+.vscode/
+
+# Сторонний эталонный код (порт ядра живёт в src/v8help)
+third_party/
+
+# Базы данных и временные файлы
+*.db
+*.db-wal
+*.db-shm
+
+# Локальный конфиг с путями к установленной 1С (пример — v8help.example.toml)
+v8help.toml

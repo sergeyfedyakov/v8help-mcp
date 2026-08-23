@@ -1,0 +1,33 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "indexing": {
+    "enabled": true,
+    "provider": "openai-compatible",
+    "model": "text-embedding-qwen3-embedding-0.6b",
+    "dimension": 1024,
+    "vectorStore": "lancedb",
+    "openai-compatible": {
+      "baseUrl": "http://localhost:1234/v1",
+      "apiKey": ""
+    },
+    "lancedb": {},
+    "fileExtensions": [
+      ".py",
+      ".md",
+      ".json",
+      ".jsonc",
+      ".toml"
+    ],
+    "searchMinScore": 0.4,
+    "searchMaxResults": 20,
+    "embeddingBatchSize": 60,
+    "scannerMaxBatchRetries": 3
+  },
+  "mcp": {
+    "v8help": {
+      "type": "local",
+      "command": [".venv/Scripts/v8help-mcp.exe"],
+      "enabled": true
+    }
+  }
+}

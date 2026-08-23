@@ -1,0 +1,10 @@
+# Тяжёлые и сторонние каталоги — не индексировать.
+# Индексируется: src, tests, .ai, .kilo, конфиги и README в корне.
+.venv/
+third_party/
+data/
+node_modules/
+__pycache__/
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "v8help"
+version = "0.1.0"
+description = "MCP-инструмент для чтения, индексации и поиска по файлам справки 1С (.hbk)"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.11",
+    "lxml>=5.0",
+    "onec-dtools>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+v8help = "v8help.cli:main"
+v8help-mcp = "v8help.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/v8help"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

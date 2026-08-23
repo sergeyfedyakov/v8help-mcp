@@ -1,0 +1,29 @@
+# Пример конфигурации v8help. Скопируйте в v8help.toml и укажите свои пути.
+# Реальный v8help.toml не должен попадать в git (см. .gitignore).
+
+# Каталог bin установленной платформы 1С:Предприятие.
+bin_dir = "C:/Program Files/1cv8/8.5.1.1423/bin"
+
+# Промежуточный markdown-корпус и итоговая БД.
+corpus_dir = "data/corpus"
+db_path = "data/v8help.db"
+
+# Язык по умолчанию: ru (файлы *_ru.hbk) или en (*_root.hbk).
+lang = "ru"
+
+# Книги по умолчанию (shorthand через bin_dir/<книга>.hbk).
+books = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"]
+
+# Явные источники (альтернатива books/bin_dir).
+# [[sources]]
+# id = "shquery"
+# hbk = "C:/Program Files/1cv8/8.5.1.1423/bin/shquery_ru.hbk"
+# prefix = "query__"
+# scheme = "SyntaxHelperQueries"
+
+[search]
+backend = "fts"
+limit = 10
+
+[build]
+cleanup = false
