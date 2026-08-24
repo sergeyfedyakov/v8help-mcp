@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS links (
 );
 CREATE INDEX IF NOT EXISTS idx_links_src ON links(src);
 CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
+
+CREATE TABLE IF NOT EXISTS vectors (
+    page_id INTEGER PRIMARY KEY REFERENCES pages(id),
+    vec     BLOB NOT NULL
+);
 """
 
 
@@ -65,6 +70,7 @@ class Database:
             "DROP TABLE IF EXISTS pages;"
             "DROP TABLE IF EXISTS pages_fts;"
             "DROP TABLE IF EXISTS links;"
+            "DROP TABLE IF EXISTS vectors;"
             "DROP TABLE IF EXISTS meta;"
         )
         conn.executescript(SCHEMA)
@@ -99,4 +105,10 @@ class Database:
         conn.executemany(
             "INSERT INTO links(src,dst) VALUES(?,?)",
             [(src, d) for d in dsts],
+        )
+
+    def insert_vector(self, conn: sqlite3.Connection, page_id: int, vec: bytes) -> None:
+        conn.execute(
+            "INSERT INTO vectors(page_id, vec) VALUES(?,?)",
+            (page_id, vec),
         )

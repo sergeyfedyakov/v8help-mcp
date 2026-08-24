@@ -66,7 +66,8 @@ def test_tools_list(tmp_path):
     )
     names = {t["name"] for t in resp["result"]["tools"]}
     assert names == {
-        "search", "get_page", "hierarchy", "related", "build", "build_status", "discover"
+        "search", "get_page", "hierarchy", "related", "build", "build_status",
+        "discover", "config_get", "config_set",
     }
 
 
@@ -123,6 +124,45 @@ def test_tool_related(tmp_path):
 def test_tool_get_page_missing(tmp_path):
     server = McpServer(_build_tiny_index(tmp_path))
     resp = _call(server, 6, "get_page", {"id": "нет_такой"})
+    assert resp["result"]["isError"] is True
+
+
+def test_tool_config_get(tmp_path):
+    server = McpServer(_build_tiny_index(tmp_path))
+    resp = _call(server, 40, "config_get", {})
+    data = _result_payload(resp)
+    assert data["search"]["backend"] == "fts"
+    assert "embedder" in data
+
+
+def test_tool_config_set_persists(tmp_path):
+    config = _build_tiny_index(tmp_path)
+    config_path = str(tmp_path / "v8help.toml")
+    server = McpServer(config, config_path=config_path)
+    resp = _call(
+        server, 41, "config_set",
+        {"values": {"search.backend": "hybrid", "search.limit": 25}},
+    )
+    data = _result_payload(resp)
+    assert data["config"]["search"]["backend"] == "hybrid"
+    assert data["config"]["search"]["limit"] == 25
+    from pathlib import Path
+
+    assert Path(config_path).exists()
+    loaded = Config.load(config_path)
+    assert loaded.search.backend == "hybrid"
+    assert loaded.search.limit == 25
+
+
+def test_tool_config_set_bad_backend(tmp_path):
+    server = McpServer(_build_tiny_index(tmp_path))
+    resp = _call(server, 42, "config_set", {"values": {"search.backend": "bogus"}})
+    assert resp["result"]["isError"] is True
+
+
+def test_tool_config_set_unknown_key(tmp_path):
+    server = McpServer(_build_tiny_index(tmp_path))
+    resp = _call(server, 43, "config_set", {"values": {"nope.key": 1}})
     assert resp["result"]["isError"] is True
 
 

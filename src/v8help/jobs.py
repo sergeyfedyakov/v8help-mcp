@@ -37,6 +37,10 @@ class Job:
             "duration_sec": r.duration_sec if r else None,
             "db_path": r.db_path if r else None,
             "bin_dir": r.bin_dir if r else None,
+            "vectors": r.vectors if r else None,
+            "embed_model": r.embed_model if r else None,
+            "embed_dims": r.embed_dims if r else None,
+            "embed_chars": r.embed_chars if r else None,
             "error": self.error or None,
         }
 

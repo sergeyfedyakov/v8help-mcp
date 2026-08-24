@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tomllib
@@ -25,6 +26,8 @@ class EmbedderConfig:
     base_url: str = ""
     api_key: str = ""
     dims: int = 0
+    batch_size: int = 64
+    embed_chars: int = 500
 
 
 @dataclass
@@ -148,6 +151,45 @@ class Config:
             )
         return out
 
+    def to_dict(self) -> dict:
+        """Сериализация для config_get / персиста в TOML."""
+        def _emb(e: EmbedderConfig) -> dict:
+            return {
+                "model": e.model,
+                "base_url": e.base_url,
+                "api_key": e.api_key,
+                "dims": e.dims,
+                "batch_size": e.batch_size,
+                "embed_chars": e.embed_chars,
+            }
+
+        d: dict = {
+            "bin_dir": str(self.bin_dir) if str(self.bin_dir) not in ("", ".") else "",
+            "corpus_dir": str(self.corpus_dir),
+            "db_path": str(self.db_path),
+            "lang": self.lang,
+            "books": list(self.books),
+            "include_english": self.include_english,
+            "search": {"backend": self.search.backend, "limit": self.search.limit},
+            "build": {"cleanup": self.build.cleanup},
+            "embedder": {
+                "index": _emb(self.embedder_index),
+                "query": _emb(self.embedder_query),
+            },
+        }
+        if self.sources:
+            d["sources"] = [
+                {
+                    "id": s.id,
+                    "hbk": str(s.hbk),
+                    "prefix": s.prefix,
+                    "scheme": s.scheme,
+                    "lang": s.lang,
+                }
+                for s in self.sources
+            ]
+        return d
+
 
 def _embedder(data: dict) -> EmbedderConfig:
     return EmbedderConfig(
@@ -155,6 +197,8 @@ def _embedder(data: dict) -> EmbedderConfig:
         base_url=data.get("base_url", ""),
         api_key=data.get("api_key", ""),
         dims=int(data.get("dims", 0)),
+        batch_size=int(data.get("batch_size", 64)),
+        embed_chars=int(data.get("embed_chars", 500)),
     )
 
 
@@ -347,5 +391,94 @@ def discover_bin_dir() -> Path | None:
 
 
 def reset_discovery_cache() -> None:
-    global _bin_dir_cache
+    global _bin_dir_cache, _embedders_cache
     _bin_dir_cache = (False, None)
+    _embedders_cache = (False, [])
+
+
+# ---------- Дискавери эмбеддеров (OpenAI-совместимые /v1/models) -------------
+
+_EMBEDDER_PORTS = (1234, 11434, 8000, 8080, 4891, 5000, 3000)
+
+_embedders_cache: tuple[bool, list[dict]] = (False, [])
+
+
+def discover_embedders(timeout: float = 0.8) -> list[dict]:
+    """Пробует OpenAI-совместимые ``/v1/models`` на localhost (LM Studio, Ollama, …).
+
+    Возвращает ``[{base_url, models, embedding_models}]``. Результат кешируется.
+    """
+    global _embedders_cache
+    done, val = _embedders_cache
+    if done:
+        return val
+
+    import urllib.request as _ur
+
+    out: list[dict] = []
+    for port in _EMBEDDER_PORTS:
+        base = f"http://localhost:{port}/v1"
+        try:
+            req = _ur.Request(f"{base}/models", method="GET")
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            continue
+        models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+        if not models:
+            continue
+        out.append(
+            {
+                "base_url": base,
+                "models": models,
+                "embedding_models": [m for m in models if "embed" in m.lower()],
+            }
+        )
+    _embedders_cache = (True, out)
+    return out
+
+
+# ---------- Минимальный TOML-сериализатор (для config_set) -------------------
+
+def _toml_scalar(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    raise TypeError(f"Неподдерживаемый тип для TOML: {type(v)}")
+
+
+def config_to_toml(data: dict) -> str:
+    """Сериализует структуру ``Config.to_dict()`` в валидный TOML."""
+    scalars: list[str] = []
+    tables: list[str] = []
+
+    def _emit_table(name: str, table: dict) -> None:
+        tables.append(f"[{name}]")
+        for k, v in table.items():
+            if isinstance(v, dict):
+                tables.append(f"[{name}.{k}]")
+                for kk, vv in v.items():
+                    tables.append(f"{kk} = {_toml_scalar(vv)}")
+            elif isinstance(v, list):
+                tables.append(f"{k} = [{', '.join(_toml_scalar(x) for x in v)}]")
+            else:
+                tables.append(f"{k} = {_toml_scalar(v)}")
+
+    for k, v in data.items():
+        if isinstance(v, dict):
+            _emit_table(k, v)
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            for item in v:
+                tables.append(f"[[{k}]]")
+                for kk, vv in item.items():
+                    tables.append(f"{kk} = {_toml_scalar(vv)}")
+        elif isinstance(v, list):
+            scalars.append(f"{k} = [{', '.join(_toml_scalar(x) for x in v)}]")
+        else:
+            scalars.append(f"{k} = {_toml_scalar(v)}")
+
+    body = "\n".join(scalars + tables)
+    return (body + "\n") if body else ""

@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, TextIO
 
 from v8help import __version__
-from v8help.config import Config, discover_platforms
+from v8help.config import Config, config_to_toml, discover_embedders, discover_platforms
 from v8help.db import Database
 from v8help.jobs import get_manager
+from v8help.search import make_backend
+from v8help.search.embedder import EmbedderError
 from v8help.search.fts import FtsBackend
 
 SERVER_NAME = "v8help"
@@ -140,11 +144,38 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "discover",
         "description": (
-            "Показать конфиг и автодискавери: каталог bin установленной платформы "
-            "1С (реестр Uninstall/ФС) и состояние индекса. В перспективе — доступные "
-            "LLM на localhost-портах."
+            "Показать конфиг и автодискавери: каталог bin установленной платформы 1С "
+            "(реестр Uninstall/ФС), доступные эмбеддеры на localhost-портах "
+            "(LM Studio/Ollama) и состояние индекса."
         ),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "config_get",
+        "description": (
+            "Текущие настройки (эффективный конфиг): эмбеддер, search.backend, "
+            "bin_dir, книги и пр."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "config_set",
+        "description": (
+            "Изменить настройки и сохранить в v8help.toml (атомарно). Ключи: "
+            "search.backend (fts|hybrid|vectors), search.limit, build.cleanup, "
+            "embedder.index/query.{model,base_url,api_key,dims,batch_size,embed_chars}, "
+            "bin_dir, lang, books."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "object",
+                    "description": "Плоские ключи -> значения",
+                },
+            },
+            "required": ["values"],
+        },
     },
 ]
 
@@ -173,8 +204,9 @@ def _json_rpc_error(msg_id: Any, code: int, message: str) -> dict:
 
 
 class McpServer:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, config_path: str | None = None) -> None:
         self.config = config
+        self.config_path = config_path
         self.db_path = Path(config.db_path)
 
     def handle_message(self, msg: dict) -> dict | None:
@@ -241,16 +273,26 @@ class McpServer:
     # --- инструменты ---
 
     def _tool_search(self, args: dict) -> dict:
-        backend = FtsBackend(self.db_path)
         limit = int(args.get("limit") or self.config.search.limit)
-        results = backend.search(
-            str(args["query"]),
-            limit=limit,
-            section=args.get("section"),
-            kind=args.get("kind"),
-        )
+        query = str(args["query"])
+        section = args.get("section")
+        kind = args.get("kind")
+        backend = make_backend(self.config, self.db_path)
+        name = (self.config.search.backend or "fts").lower()
+        try:
+            results = backend.search(
+                query, limit=limit, section=section, kind=kind
+            )
+            used = name
+        except (EmbedderError, sqlite3.OperationalError):
+            # Нет эмбеддера/векторов — деградируем на FTS.
+            results = FtsBackend(self.db_path).search(
+                query, limit=limit, section=section, kind=kind
+            )
+            used = "fts (fallback)"
         return {
             "count": len(results),
+            "backend": used,
             "results": [dataclasses.asdict(r) for r in results],
         }
 
@@ -374,24 +416,90 @@ class McpServer:
                 meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
                 pages = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
                 links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+                has_vectors = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors'"
+                ).fetchone()
+                vectors = (
+                    conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+                    if has_vectors else 0
+                )
             finally:
                 conn.close()
-            index.update({"pages": pages, "links": links, "meta": meta})
+            index.update({"pages": pages, "links": links, "vectors": vectors, "meta": meta})
         bd = self.config.resolve_bin_dir()
         bin_dir = str(bd) if str(bd) not in ("", ".") else ""
         return {
             "bin_dir": bin_dir,
             "bin_dir_explicit": str(self.config.bin_dir) not in ("", "."),
             "platforms": discover_platforms(),
-            "config": {
-                "db_path": str(self.config.db_path),
-                "corpus_dir": str(self.config.corpus_dir),
-                "books": self.config.books,
-                "lang": self.config.lang,
-                "search": dataclasses.asdict(self.config.search),
-            },
+            "embedders": discover_embedders(),
+            "config": self.config.to_dict(),
             "index": index,
         }
+
+    def _tool_config_get(self, args: dict) -> dict:
+        return self.config.to_dict()
+
+    def _tool_config_set(self, args: dict) -> dict:
+        values = args.get("values") or {}
+        if not isinstance(values, dict):
+            raise ValueError("values должен быть объектом key=value")
+        for key, value in values.items():
+            _apply_config_value(self.config, key, value)
+        self._persist_config()
+        return {"config": self.config.to_dict()}
+
+    def _persist_config(self) -> None:
+        if not self.config_path:
+            return
+        path = Path(self.config_path)
+        text = config_to_toml(self.config.to_dict())
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def _coerce_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    return bool(v)
+
+
+def _apply_config_value(config: Config, key: str, value) -> None:
+    """Применяет одно плоское значение к Config (для config_set)."""
+    parts = str(key).split(".")
+    head = parts[0]
+    if head == "search" and len(parts) == 2:
+        if parts[1] == "backend":
+            v = str(value).lower()
+            if v not in ("fts", "hybrid", "vectors"):
+                raise ValueError(f"search.backend: fts|hybrid|vectors, получено {value!r}")
+            config.search.backend = v
+        elif parts[1] == "limit":
+            config.search.limit = int(value)
+        else:
+            raise KeyError(key)
+    elif head == "build" and len(parts) == 2 and parts[1] == "cleanup":
+        config.build.cleanup = _coerce_bool(value)
+    elif head == "bin_dir":
+        config.bin_dir = Path(str(value))
+    elif head == "lang":
+        config.lang = str(value)
+    elif head == "books":
+        config.books = [str(x) for x in value]
+    elif head == "embedder" and len(parts) == 3 and parts[1] in ("index", "query"):
+        target = config.embedder_index if parts[1] == "index" else config.embedder_query
+        field = parts[2]
+        if field in ("dims", "batch_size", "embed_chars"):
+            setattr(target, field, int(value))
+        elif field in ("model", "base_url", "api_key"):
+            setattr(target, field, str(value))
+        else:
+            raise KeyError(key)
+    else:
+        raise KeyError(key)
 
 
 _TOOL_HANDLERS = {
@@ -402,6 +510,8 @@ _TOOL_HANDLERS = {
     "build": McpServer._tool_build,
     "build_status": McpServer._tool_build_status,
     "discover": McpServer._tool_discover,
+    "config_get": McpServer._tool_config_get,
+    "config_set": McpServer._tool_config_set,
 }
 
 
@@ -421,6 +531,7 @@ def run(
     config: Config,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
+    config_path: str | None = None,
 ) -> int:
     if stdin is None:
         _reconfigure_utf8(sys.stdin)
@@ -429,7 +540,7 @@ def run(
         _reconfigure_utf8(sys.stdout)
         stdout = sys.stdout
     _reconfigure_utf8(sys.stderr)
-    server = McpServer(config)
+    server = McpServer(config, config_path=config_path)
     for line in stdin:
         line = line.strip()
         if not line:
@@ -461,10 +572,21 @@ def main(argv: list[str] | None = None) -> int:
             config = Config.load(config_path)
         except FileNotFoundError:
             print(f"[v8help] config не найден: {config_path} — использую defaults", file=sys.stderr)
+            config_path = None
     if config is None:
-        config = Config()
+        # По умолчанию подхватываем PROJECT_ROOT/v8help.toml (создаётся config_set).
+        default_cfg = PROJECT_ROOT / "v8help.toml"
+        if default_cfg.exists():
+            try:
+                config = Config.load(default_cfg)
+                config_path = str(default_cfg)
+            except Exception as exc:
+                print(f"[v8help] ошибка чтения {default_cfg}: {exc}", file=sys.stderr)
+                config = Config()
+        else:
+            config = Config()
     base = Path(config_path).resolve().parent if config_path else PROJECT_ROOT
-    return run(_resolve_paths(config, base))
+    return run(_resolve_paths(config, base), config_path=config_path)
 
 
 if __name__ == "__main__":
