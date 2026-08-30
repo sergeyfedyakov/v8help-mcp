@@ -6,7 +6,17 @@ build-backend = "hatchling.build"
 name = "v8help"
 version = "0.10.0"
 description = "MCP-инструмент для чтения, индексации и поиска по файлам справки 1С (.hbk)"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Sergey Fedyakov" }]
 requires-python = ">=3.11"
+keywords = ["1c", "1с", "hbk", "mcp", "help", "sqlite", "fts5", "embeddings"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Software Development :: Documentation",
+]
 dependencies = [
     "beautifulsoup4>=4.12",
     "markdownify>=0.11",
@@ -14,6 +24,9 @@ dependencies = [
     "onec-dtools>=0.5.0",
     "numpy>=1.26",
 ]
+
+[project.urls]
+Repository = "https://github.com/sergeyfedyakov/v8help-mcp"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

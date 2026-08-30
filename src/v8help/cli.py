@@ -28,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", help="язык: ru/en (по умолчанию из конфига)")
     p.add_argument("--cleanup", action="store_true", help="удалить corpus после индексации")
     p.add_argument("--force", action="store_true", help="пересобрать даже если индекс актуален")
+    p.add_argument("--chunk-size", type=int, help="целевой размер чанка в символах")
+    p.add_argument("--chunk-overlap", type=int, help="перекрытие соседних чанков в символах")
 
     p = sub.add_parser("search", help="поиск по справке")
     p.add_argument("query", help="поисковый запрос")
@@ -37,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("get-page", help="полный текст страницы")
     p.add_argument("id", help="идентификатор страницы (filename или числовой id)")
+    p.add_argument("--chunk", type=int, default=None, help="номер чанка длинной статьи (0-based)")
 
     p = sub.add_parser("hierarchy", help="дерево TOC")
     p.add_argument("--section", help="фильтр по разделу")
@@ -91,6 +94,10 @@ def _build(args, config: Config) -> int:
         config.lang = args.lang
     if args.cleanup:
         config.build.cleanup = True
+    if args.chunk_size:
+        config.build.chunk_size = args.chunk_size
+    if args.chunk_overlap:
+        config.build.chunk_overlap = args.chunk_overlap
     result = run_build(config, force=args.force, on_progress=_print_progress)
     if result.skipped:
         print("Индекс актуален — пропуск.", file=sys.stderr)
@@ -130,6 +137,19 @@ def _get_page(args, config: Config) -> int:
         if row is None:
             print(f"Страница не найдена: {args.id}", file=sys.stderr)
             return 1
+        if args.chunk is not None:
+            chunk = conn.execute(
+                "SELECT title, body FROM chunks WHERE page_id=? AND chunk_index=?",
+                (row["id"], args.chunk),
+            ).fetchone()
+            if chunk is None:
+                print(f"Чанк {args.chunk} не найден (статья не разбита или номер вне диапазона).",
+                      file=sys.stderr)
+                return 1
+            print(f"# {row['title']} [чанк {args.chunk}]")
+            print()
+            print(chunk["body"])
+            return 0
         print(f"# {row['title']}")
         print(f"id={row['id']} section={row['section']} kind={row['kind']} source={row['hbk_source']}")
         print()
