@@ -1,8 +1,12 @@
-"""Векторный поиск в SQLite (numpy, brute-force cosine).
+"""Векторный поиск в SQLite (numpy, brute-force cosine) по чанкам.
 
 Векторы хранятся в БД уже нормализованными (unit length) → косинус = скалярное
 произведение. Матрица векторов кешируется в памяти процесса; инвалидация по
 mtime БД (после пересборки).
+
+Единица поиска — чанк. Результат несёт метаданные родителя (страницы) и номер
+чанка. Дедупликация по родителю: не более ``max_chunks_per_page`` чанков одной
+статьи в выдаче.
 """
 
 from __future__ import annotations
@@ -17,9 +21,15 @@ from v8help.search.embedder import Embedder
 
 
 class VectorBackend:
-    def __init__(self, db_path: str | Path, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        embedder: Embedder,
+        max_chunks_per_page: int = 2,
+    ) -> None:
         self.db_path = Path(db_path)
         self.embedder = embedder
+        self.max_chunks_per_page = max_chunks_per_page
         self._cache: tuple[tuple[str, float], np.ndarray, list[dict]] | None = None
 
     def _load(self) -> tuple[np.ndarray, list[dict]]:
@@ -35,8 +45,12 @@ class VectorBackend:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT p.id, p.filename, p.title, p.section, p.kind, v.vec"
-                " FROM vectors v JOIN pages p ON p.id = v.page_id"
+                "SELECT c.id AS chunk_id, c.chunk_index, c.title AS chunk_title,"
+                " p.filename, p.title, p.section, p.kind, v.vec,"
+                " (SELECT COUNT(*) FROM chunks cc WHERE cc.page_id = p.id) AS total"
+                " FROM vectors v"
+                " JOIN chunks c ON c.id = v.chunk_id"
+                " JOIN pages p ON p.id = c.page_id"
             ).fetchall()
         finally:
             conn.close()
@@ -51,11 +65,14 @@ class VectorBackend:
         )
         metas = [
             {
-                "id": r["id"],
                 "filename": r["filename"],
                 "title": r["title"],
                 "section": r["section"],
                 "kind": r["kind"],
+                "chunk_id": r["chunk_id"],
+                "chunk_index": r["chunk_index"],
+                "chunk_title": r["chunk_title"],
+                "total_chunks": r["total"],
             }
             for r in rows
         ]
@@ -88,21 +105,33 @@ class VectorBackend:
             return []
 
         scores = vecs[idx] @ q
-        top = np.argsort(-scores)[:limit]
+        top = np.argsort(-scores)[:limit * 4]
 
         out: list[SearchResult] = []
+        seen: dict[str, int] = {}
         for k in top:
             i = int(idx[k])
             m = metas[i]
+            fname = m["filename"]
+            used = seen.get(fname, 0)
+            if used >= self.max_chunks_per_page:
+                continue
+            seen[fname] = used + 1
             out.append(
                 SearchResult(
-                    id=m["filename"],
+                    id=fname,
                     title=m["title"],
-                    snippet=m["title"],
-                    source_path=m["filename"],
+                    snippet=m["chunk_title"],
+                    source_path=fname,
                     section=m["section"],
                     kind=m["kind"],
                     score=float(scores[k]),
+                    chunk_id=m["chunk_id"],
+                    chunk_index=m["chunk_index"],
+                    total_chunks=m["total_chunks"],
+                    chunk_title=m["chunk_title"],
                 )
             )
+            if len(out) >= limit:
+                break
         return out

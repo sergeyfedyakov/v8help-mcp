@@ -39,6 +39,26 @@ def test_config_defaults_roundtrip(tmp_path):
     assert loaded.embedder_index.model == ""
     assert loaded.embedder_index.batch_size == 64
     assert loaded.embedder_index.embed_chars == 500
+    assert loaded.embedder_index.threads == 2
+    assert loaded.search.max_chunks_per_page == 2
+    assert loaded.build.chunk_size == 1500
+    assert loaded.build.chunk_overlap == 200
+
+
+def test_config_new_fields_roundtrip(tmp_path):
+    cfg = Config()
+    cfg.embedder_index.threads = 4
+    cfg.search.max_chunks_per_page = 1
+    cfg.build.chunk_size = 2000
+    cfg.build.chunk_overlap = 250
+    toml_text = config_to_toml(cfg.to_dict())
+    p = tmp_path / "v8help.toml"
+    p.write_text(toml_text, encoding="utf-8")
+    loaded = Config.load(p)
+    assert loaded.embedder_index.threads == 4
+    assert loaded.search.max_chunks_per_page == 1
+    assert loaded.build.chunk_size == 2000
+    assert loaded.build.chunk_overlap == 250
 
 
 def test_toml_embedder_query_section(tmp_path):

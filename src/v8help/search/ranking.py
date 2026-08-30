@@ -5,19 +5,26 @@ from __future__ import annotations
 from v8help.search.base import SearchResult
 
 
+def _key(item: SearchResult) -> tuple:
+    """Ключ слияния: чанк (если есть), иначе страница."""
+    if item.chunk_id:
+        return (item.id, item.chunk_id)
+    return (item.id, 0)
+
+
 def reciprocal_rank_fusion(
     ranked_lists: list[list[SearchResult]],
     k: int = 60,
 ) -> list[SearchResult]:
     """Сливает несколько ранжированных списков по RRF.
 
-    При дубле по ``id`` оставляет первый встреченный объект (обычно из более
-    «точного» списка, напр. FTS со сниппетом) и суммирует RRF-очки.
+    При дубле по ``(id, chunk_id)`` оставляет первый встреченный объект (обычно
+    из более «точного» списка, напр. FTS со сниппетом) и суммирует RRF-очки.
     """
-    scores: dict[str, tuple[float, SearchResult]] = {}
+    scores: dict[tuple, tuple[float, SearchResult]] = {}
     for lst in ranked_lists:
         for rank, item in enumerate(lst):
-            key = item.id
+            key = _key(item)
             rrf = 1.0 / (k + rank + 1)
             if key in scores:
                 cur, kept = scores[key]

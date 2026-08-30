@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "v8help"
-version = "0.9.1"
+version = "0.10.0"
 description = "MCP-инструмент для чтения, индексации и поиска по файлам справки 1С (.hbk)"
 requires-python = ">=3.11"
 dependencies = [

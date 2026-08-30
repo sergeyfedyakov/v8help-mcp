@@ -1,9 +1,21 @@
-"""FTS5-поиск: двухуровневый (title -> body) с лестничным смягчением.
+"""FTS5-поиск по чанкам: двухуровневый с весами колонок.
 
-Буст заголовков достигается не дублированием title в индексе, а явным
-двухуровневым поиском: сначала точные совпадения по колонке ``title``, затем
-мягкий поиск по ``body`` (добивка до ``limit``). Внутри — лестница от строгого
-к мягкому: NEAR -> AND -> back-off (удаление лишнего токена) -> OR -> префикс.
+``chunks_fts`` содержит колонки ``title`` / ``description`` / ``body`` (секция
+«Описание:» статьи). Поиск двухуровневый:
+
+1. Строгие совпадения в заголовке (``title:AND``/``NEAR``/back-off) — точные
+   названия статей («Глобальный контекст») остаются в топе несмотря на низкий
+   idf распространённых слов.
+2. Единый мягкий запрос по всем колонкам с ранжированием
+   ``bm25(chunks_fts, 9.0, 3.0, 1.0)``: совпадение в заголовке в 9 раз
+   весомее телесного, в описании — в 3 раза.
+
+Внутри лестницы — от строгого к мягкому: NEAR -> AND -> back-off (удаление
+лишнего токена) -> OR -> префикс.
+
+Единица поиска — чанк (``chunks``/``chunks_fts``); результат несёт метаданные
+родителя (страницы). Дедупликация по родителю — не более ``max_chunks_per_page``
+чанков одной статьи в выдаче.
 """
 
 from __future__ import annotations
@@ -17,6 +29,11 @@ from v8help.search.base import SearchResult
 _LIKE_SCORE = 1e9
 
 MAX_AND_TOKENS = 4
+
+# Веса колонок chunks_fts для bm25: заголовок / описание / тело.
+_TITLE_WEIGHT = 9.0
+_DESCRIPTION_WEIGHT = 3.0
+_BODY_WEIGHT = 1.0
 
 # Стоп-слова: предлоги/союзы/частицы/местоимения. Убираются из запроса только
 # тогда, когда после их удаления остаётся хотя бы один значимый токен, чтобы не
@@ -73,16 +90,16 @@ def _tokenize(query: str) -> list[str]:
     return significant if significant else tokens
 
 
-def _and_q_field(field: str, tokens: list[str]) -> str:
-    return f"{field}:({' AND '.join(tokens)})"
+def _and_q(tokens: list[str]) -> str:
+    return "(" + " AND ".join(tokens) + ")"
 
 
-def _or_q_field(field: str, tokens: list[str]) -> str:
-    return f"{field}:({' OR '.join(tokens)})"
+def _or_q(tokens: list[str]) -> str:
+    return "(" + " OR ".join(tokens) + ")"
 
 
-def _near_q_field(field: str, tokens: list[str], dist: int) -> str:
-    return f"{field}:NEAR({' '.join(tokens)}, {dist})"
+def _near_q(tokens: list[str], dist: int) -> str:
+    return f"NEAR({' '.join(tokens)}, {dist})"
 
 
 def _snippet(text: str, term: str, width: int = 120) -> str | None:
@@ -110,8 +127,13 @@ def _make_snippet(body: str, title: str, query: str) -> str:
 
 
 class FtsBackend:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        max_chunks_per_page: int = 2,
+    ) -> None:
         self.db_path = Path(db_path)
+        self.max_chunks_per_page = max_chunks_per_page
 
     def search(
         self,
@@ -124,14 +146,14 @@ class FtsBackend:
         conn.row_factory = sqlite3.Row
         try:
             if not conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
             ).fetchone():
                 return []
 
             tokens = _tokenize(query)
             if not tokens:
                 return self._substring_search(
-                    conn, query, limit, section, kind, set(), in_body=True
+                    conn, query, limit, section, kind, in_body=True
                 )
 
             if len(tokens) > MAX_AND_TOKENS:
@@ -139,37 +161,58 @@ class FtsBackend:
                 tokens = sorted(tokens, key=lambda t: (df[t], t))[:MAX_AND_TOKENS]
 
             results: list[SearchResult] = []
-            seen: set[str] = set()
 
-            # Уровень 1 — точные совпадения в заголовке.
+            # Уровень 1 — строгие совпадения в заголовке: точное название
+            # статьи («Глобальный контекст», «Журнал регистрации») должно быть
+            # в топе, несмотря на низкий idf распространённых слов.
             results += self._search_title(
-                conn, tokens, query, limit, section, kind, seen
+                conn, tokens, query, limit, section, kind
             )
 
-            # Уровень 2 — мягкий поиск по телу (добивка).
+            # Уровень 2 — единый запрос по всем колонкам (title/description/body),
+            # ранжирование bm25 с весами колонок; лестница смягчения ниже.
             remaining = limit - len(results)
             if remaining > 0:
-                results += self._search_body(
-                    conn, tokens, query, remaining, section, kind, seen
+                results += self._search(
+                    conn, tokens, query, remaining, section, kind
                 )
 
             # LIKE-fallback: сначала заголовок, потом тело.
             remaining = limit - len(results)
             if remaining > 0:
                 results += self._substring_search(
-                    conn, query, remaining, section, kind, seen, in_body=False
+                    conn, query, remaining, section, kind, in_body=False
                 )
             remaining = limit - len(results)
             if remaining > 0:
                 results += self._substring_search(
-                    conn, query, remaining, section, kind, seen, in_body=True
+                    conn, query, remaining, section, kind, in_body=True
                 )
 
-            return results
+            return self._dedup(results)
         finally:
             conn.close()
 
-    def _search_title(self, conn, tokens, query, limit, section, kind, seen):
+    def _dedup(self, results: list[SearchResult]) -> list[SearchResult]:
+        """Схлопывает одинаковые чанки и не допускает больше
+        ``max_chunks_per_page`` чанков одной статьи в выдаче."""
+        out: list[SearchResult] = []
+        seen_chunks: set[int] = set()
+        seen_pages: dict[str, int] = {}
+        for r in results:
+            if r.chunk_id and r.chunk_id in seen_chunks:
+                continue
+            if self.max_chunks_per_page > 0:
+                used = seen_pages.get(r.id, 0)
+                if used >= self.max_chunks_per_page:
+                    continue
+                seen_pages[r.id] = used + 1
+            if r.chunk_id:
+                seen_chunks.add(r.chunk_id)
+            out.append(r)
+        return out
+
+    def _search_title(self, conn, tokens, query, limit, section, kind):
         """Только строгие совпадения по заголовку: NEAR, AND, back-off."""
         out: list[SearchResult] = []
 
@@ -177,63 +220,64 @@ class FtsBackend:
             rem = limit - len(out)
             if rem > 0:
                 out.extend(
-                    self._fts_search(conn, fts_q, query, rem, section, kind, seen)
+                    self._fts_search(conn, fts_q, query, rem, section, kind)
                 )
 
         if len(tokens) >= 2:
-            add(_near_q_field("title", tokens, len(tokens) * 5 + 3))
-        add(_and_q_field("title", tokens))
+            add(f"title:{_near_q(tokens, len(tokens) * 5 + 3)}")
+        add(f"title:{_and_q(tokens)}")
         if len(tokens) >= 2 and len(out) < limit:
             out.extend(
                 self._backoff(
-                    conn, tokens, query, limit - len(out), section, kind, seen,
+                    conn, tokens, query, limit - len(out), section, kind,
                     "title",
                 )
             )
         return out
 
-    def _search_body(self, conn, tokens, query, limit, section, kind, seen):
-        """Полная лестница по телу: NEAR, AND, back-off, OR, префикс."""
+    def _search(self, conn, tokens, query, limit, section, kind):
+        """Полная лестница по всем колонкам: NEAR, AND, back-off, OR, префикс."""
         out: list[SearchResult] = []
 
         def add(fts_q: str) -> None:
             rem = limit - len(out)
             if rem > 0:
                 out.extend(
-                    self._fts_search(conn, fts_q, query, rem, section, kind, seen)
+                    self._fts_search(conn, fts_q, query, rem, section, kind)
                 )
 
         if len(tokens) >= 2:
-            add(_near_q_field("body", tokens, len(tokens) * 5 + 3))
-        add(_and_q_field("body", tokens))
+            add(_near_q(tokens, len(tokens) * 5 + 3))
+        add(_and_q(tokens))
         if len(tokens) >= 2 and len(out) < limit:
             out.extend(
                 self._backoff(
-                    conn, tokens, query, limit - len(out), section, kind, seen,
-                    "body",
+                    conn, tokens, query, limit - len(out), section, kind,
                 )
             )
-        add(_or_q_field("body", tokens))
-        add(_or_q_field("body", [t + "*" for t in tokens]))
+        add(_or_q(tokens))
+        add(_or_q([t + "*" for t in tokens]))
         return out
 
-    def _backoff(self, conn, tokens, query, limit, section, kind, seen, field):
+    def _backoff(self, conn, tokens, query, limit, section, kind, field=None):
         """Удаляет один токен, выбирая удаление с максимумом ненулевых совпадений."""
         best_sub = None
         best_count = 0
         best_q = None
         for i in range(len(tokens)):
             sub = tokens[:i] + tokens[i + 1:]
-            q = _and_q_field(field, sub)
+            q = _and_q(sub)
+            if field:
+                q = f"{field}:{q}"
             c = self._count(conn, q, section, kind)
             if c > best_count:
                 best_count, best_sub, best_q = c, sub, q
         if best_count > 0:
-            return self._fts_search(conn, best_q, query, limit, section, kind, seen)
+            return self._fts_search(conn, best_q, query, limit, section, kind)
         return []
 
     def _count(self, conn, fts_q, section, kind) -> int:
-        conds = ["pages_fts MATCH ?"]
+        conds = ["chunks_fts MATCH ?"]
         params: list = [fts_q]
         if section:
             conds.append("p.section = ?")
@@ -242,13 +286,14 @@ class FtsBackend:
             conds.append("p.kind = ?")
             params.append(kind)
         sql = (
-            "SELECT count(*) FROM pages_fts JOIN pages p ON p.id = pages_fts.rowid"
+            "SELECT count(*) FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid"
+            " JOIN pages p ON p.id = c.page_id"
             " WHERE " + " AND ".join(conds)
         )
         return conn.execute(sql, params).fetchone()[0]
 
-    def _fts_search(self, conn, fts_q, query, limit, section, kind, seen):
-        conds = ["pages_fts MATCH ?"]
+    def _fts_search(self, conn, fts_q, query, limit, section, kind):
+        conds = ["chunks_fts MATCH ?"]
         params: list = [fts_q]
         if section:
             conds.append("p.section = ?")
@@ -257,58 +302,74 @@ class FtsBackend:
             conds.append("p.kind = ?")
             params.append(kind)
         params.append(limit)
+        weights = (
+            f"bm25(chunks_fts, {_TITLE_WEIGHT}, {_DESCRIPTION_WEIGHT}, {_BODY_WEIGHT})"
+        )
         sql = (
-            "SELECT p.filename, p.title, p.section, p.kind, p.body,"
-            " bm25(pages_fts) AS score"
-            " FROM pages_fts JOIN pages p ON p.id = pages_fts.rowid"
-            " WHERE " + " AND ".join(conds) + " ORDER BY bm25(pages_fts) LIMIT ?"
+            "SELECT p.filename, p.title, p.section, p.kind, c.id AS chunk_id,"
+            " c.chunk_index, c.title AS chunk_title, c.body AS chunk_body,"
+            " (SELECT COUNT(*) FROM chunks cc WHERE cc.page_id = p.id) AS total,"
+            f" {weights} AS score"
+            " FROM chunks_fts"
+            " JOIN chunks c ON c.id = chunks_fts.rowid"
+            " JOIN pages p ON p.id = c.page_id"
+            " WHERE " + " AND ".join(conds)
+            + f" ORDER BY {weights} LIMIT ?"
         )
         out: list[SearchResult] = []
         for row in conn.execute(sql, params):
-            if row["filename"] in seen:
-                continue
-            seen.add(row["filename"])
             out.append(
                 SearchResult(
                     id=row["filename"],
                     title=row["title"],
-                    snippet=_make_snippet(row["body"], row["title"], query),
+                    snippet=_make_snippet(row["chunk_body"], row["chunk_title"], query),
                     source_path=row["filename"],
                     section=row["section"],
                     kind=row["kind"],
                     score=row["score"],
+                    chunk_id=row["chunk_id"],
+                    chunk_index=row["chunk_index"],
+                    total_chunks=row["total"],
+                    chunk_title=row["chunk_title"],
                 )
             )
         return out
 
-    def _substring_search(self, conn, query, limit, section, kind, seen, in_body):
+    def _substring_search(self, conn, query, limit, section, kind, in_body):
         tokens = [t.lower() for t in query.split() if t]
         if not tokens:
             return []
         conds = []
         params: list = []
         if section:
-            conds.append("section = ?")
+            conds.append("p.section = ?")
             params.append(section)
         if kind:
-            conds.append("kind = ?")
+            conds.append("p.kind = ?")
             params.append(kind)
-        sql = "SELECT filename, title, section, kind, body FROM pages"
+        sql = (
+            "SELECT p.filename, p.title, p.section, p.kind, c.id AS chunk_id,"
+            " c.chunk_index, c.title AS chunk_title, c.body AS chunk_body,"
+            " (SELECT description FROM chunks_fts WHERE rowid = c.id) AS chunk_description,"
+            " (SELECT COUNT(*) FROM chunks cc WHERE cc.page_id = p.id) AS total"
+            " FROM chunks c JOIN pages p ON p.id = c.page_id"
+        )
         if conds:
             sql += " WHERE " + " AND ".join(conds)
 
         out: list[SearchResult] = []
         for row in conn.execute(sql, params):
-            if row["filename"] in seen:
-                continue
             title_l = row["title"].lower()
             if all(t in title_l for t in tokens):
                 snip = row["title"]
-            elif in_body and all(t in row["body"].lower() for t in tokens):
-                snip = _snippet(row["body"], tokens[0]) or row["title"]
+            elif in_body and all(t in row["chunk_body"].lower() for t in tokens):
+                snip = _snippet(row["chunk_body"], tokens[0]) or row["title"]
+            elif in_body and all(
+                t in (row["chunk_description"] or "").lower() for t in tokens
+            ):
+                snip = _snippet(row["chunk_description"], tokens[0]) or row["title"]
             else:
                 continue
-            seen.add(row["filename"])
             out.append(
                 SearchResult(
                     id=row["filename"],
@@ -318,6 +379,10 @@ class FtsBackend:
                     section=row["section"],
                     kind=row["kind"],
                     score=_LIKE_SCORE,
+                    chunk_id=row["chunk_id"],
+                    chunk_index=row["chunk_index"],
+                    total_chunks=row["total"],
+                    chunk_title=row["chunk_title"],
                 )
             )
             if len(out) >= limit:

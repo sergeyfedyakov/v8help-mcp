@@ -12,9 +12,16 @@ from v8help.search.vectors import VectorBackend
 
 
 class HybridBackend:
-    def __init__(self, db_path: str | Path, embedder: Embedder) -> None:
-        self.fts = FtsBackend(db_path)
-        self.vectors = VectorBackend(db_path, embedder)
+    def __init__(
+        self,
+        db_path: str | Path,
+        embedder: Embedder,
+        max_chunks_per_page: int = 2,
+    ) -> None:
+        self.fts = FtsBackend(db_path, max_chunks_per_page=max_chunks_per_page)
+        self.vectors = VectorBackend(
+            db_path, embedder, max_chunks_per_page=max_chunks_per_page
+        )
 
     def search(
         self,
@@ -26,4 +33,5 @@ class HybridBackend:
         n = max(limit * 4, 40)
         fts = self.fts.search(query, limit=n, section=section, kind=kind)
         vec = self.vectors.search(query, limit=n, section=section, kind=kind)
-        return reciprocal_rank_fusion([fts, vec])[:limit]
+        fused = reciprocal_rank_fusion([fts, vec])[:limit]
+        return self.fts._dedup(fused)

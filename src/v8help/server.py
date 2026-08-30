@@ -27,6 +27,9 @@ from v8help.search.fts import FtsBackend
 SERVER_NAME = "v8help"
 PROTOCOL_VERSION = "2024-11-05"
 
+# Статьи длиннее этого порога целиком не выдаются: только список чанков и первый чанк.
+_PAGE_CHARS_LIMIT = 4000
+
 # Корень проекта (для editable-установки: src/v8help/server.py -> parents[2]).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -66,12 +69,34 @@ TOOLS: list[dict[str, Any]] = [
         "name": "get_page",
         "description": (
             "Полный текст страницы справки по идентификатору (filename без .md "
-            "или числовой id)."
+            "или числовой id). id может быть строкой (одна страница) или массивом "
+            "строк (несколько страниц одним вызовом, 2-10 статей, пока суммарно "
+            "не превышено max_chars). Длинные статьи (>4000 символов) целиком НЕ "
+            "возвращаются: отдаётся список чанков и первый чанк; конкретный чанк "
+            "читается через chunk=N."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Идентификатор страницы"},
+                "id": {
+                    "oneOf": [
+                        {"type": "string", "description": "Идентификатор страницы"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Несколько идентификаторов страниц",
+                        },
+                    ],
+                    "description": "Страница или список страниц",
+                },
+                "chunk": {
+                    "type": "integer",
+                    "description": "Номер чанка (0-based) для чтения части длинной статьи",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Лимит суммарного размера ответа (для массива id)",
+                },
             },
             "required": ["id"],
         },
@@ -104,8 +129,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "build",
         "description": (
             "Пересобрать индекс: распаковка .hbk -> консолидация md-корпуса -> "
-            "индексация FTS. Выполняется асинхронно: возвращает job_id сразу, "
-            "результат и прогресс — через build_status. Может занять минуты."
+            "индексация FTS + чанкование. Выполняется асинхронно: возвращает job_id "
+            "сразу, результат и прогресс — через build_status. Может занять минуты. "
+            "Параметры chunk_size/chunk_overlap (в символах) задают размер чанка и "
+            "перекрытие при разбиении длинных статей."
         ),
         "inputSchema": {
             "type": "object",
@@ -126,6 +153,14 @@ TOOLS: list[dict[str, Any]] = [
                 "force": {
                     "type": "boolean",
                     "description": "Пересобрать даже если индекс актуален",
+                },
+                "chunk_size": {
+                    "type": "integer",
+                    "description": "Целевой размер чанка в символах (по умолчанию 1500)",
+                },
+                "chunk_overlap": {
+                    "type": "integer",
+                    "description": "Перекрытие соседних чанков в символах (по умолчанию 200)",
                 },
             },
         },
@@ -162,8 +197,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "config_set",
         "description": (
             "Изменить настройки и сохранить в v8help.toml (атомарно). Ключи: "
-            "search.backend (fts|hybrid|vectors), search.limit, build.cleanup, "
-            "embedder.index/query.{model,base_url,api_key,dims,batch_size,embed_chars}, "
+            "search.backend (fts|hybrid|vectors), search.limit, "
+            "search.max_chunks_per_page, build.cleanup, build.chunk_size, "
+            "build.chunk_overlap, "
+            "embedder.index/query.{model,base_url,api_key,dims,batch_size,embed_chars,threads}, "
             "bin_dir, lang, books."
         ),
         "inputSchema": {
@@ -297,23 +334,116 @@ class McpServer:
         }
 
     def _tool_get_page(self, args: dict) -> dict:
+        max_chars = int(args.get("max_chars") or 4000)
+        chunk_index = args.get("chunk")
+        ids = args.get("id")
+        if isinstance(ids, list):
+            return self._get_pages_many(ids, max_chars)
+        if isinstance(ids, str):
+            return self._get_page_one(ids, chunk_index)
+        raise ValueError("id должен быть строкой или массивом строк")
+
+    def _get_page_one(self, ident: str, chunk_index=None) -> dict:
         db = Database(self.db_path)
         conn = db.connect()
         try:
-            row = _lookup(conn, args["id"])
-            if row is None:
-                raise KeyError(f"Страница не найдена: {args['id']}")
+            page = _lookup(conn, ident)
+            if page is None:
+                raise KeyError(f"Страница не найдена: {ident}")
+            has_chunks = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
+            ).fetchone()
+            if not has_chunks:
+                # Старая БД без чанков — отдать целиком, как раньше.
+                return {
+                    "id": page["id"],
+                    "filename": page["filename"],
+                    "title": page["title"],
+                    "section": page["section"],
+                    "kind": page["kind"],
+                    "hbk_source": page["hbk_source"],
+                    "body": page["body"],
+                }
+            chunks = conn.execute(
+                "SELECT id, chunk_index, chars FROM chunks"
+                " WHERE page_id=? ORDER BY chunk_index",
+                (page["id"],),
+            ).fetchall()
+            if not chunks:
+                # Старая БД без чанков — отдать целиком, как раньше.
+                return {
+                    "id": page["id"],
+                    "filename": page["filename"],
+                    "title": page["title"],
+                    "section": page["section"],
+                    "kind": page["kind"],
+                    "hbk_source": page["hbk_source"],
+                    "body": page["body"],
+                }
+            total = len(chunks)
+            if chunk_index is not None:
+                row = next((c for c in chunks if c["chunk_index"] == int(chunk_index)), None)
+                if row is None:
+                    raise KeyError(
+                        f"Чанк {chunk_index} не найден (всего {total})"
+                    )
+                body = conn.execute(
+                    "SELECT body FROM chunks WHERE id=?", (row["id"],)
+                ).fetchone()["body"]
+                truncated = total > 1
+            else:
+                body = page["body"]
+                truncated = False
+                if total > 1 or len(body) > _PAGE_CHARS_LIMIT:
+                    first = chunks[0]
+                    body = conn.execute(
+                        "SELECT body FROM chunks WHERE id=?", (first["id"],)
+                    ).fetchone()["body"]
+                    truncated = total > 1 or len(page["body"]) > _PAGE_CHARS_LIMIT
             return {
-                "id": row["id"],
-                "filename": row["filename"],
-                "title": row["title"],
-                "section": row["section"],
-                "kind": row["kind"],
-                "hbk_source": row["hbk_source"],
-                "body": row["body"],
+                "id": page["id"],
+                "filename": page["filename"],
+                "title": page["title"],
+                "section": page["section"],
+                "kind": page["kind"],
+                "hbk_source": page["hbk_source"],
+                "chars": len(page["body"]),
+                "chunk_index": chunk_index if chunk_index is not None else 0,
+                "total_chunks": total,
+                "truncated": truncated,
+                "chunks": [
+                    {"index": c["chunk_index"], "chars": c["chars"]}
+                    for c in chunks
+                ],
+                "body": body,
             }
         finally:
             conn.close()
+
+    def _get_pages_many(self, ids: list[str], max_chars: int) -> dict:
+        pages = []
+        missing: list[str] = []
+        total_chars = 0
+        for ident in ids:
+            if total_chars >= max_chars:
+                break
+            try:
+                page = self._get_page_one(str(ident))
+            except KeyError:
+                missing.append(str(ident))
+                continue
+            total_chars += len(page["body"])
+            if total_chars > max_chars:
+                break
+            pages.append(page)
+        return {
+            "requested": len(ids),
+            "returned": len(pages),
+            "missing": missing,
+            "total_chars": total_chars,
+            "truncated": len(pages) < len(ids) - len(missing),
+            "pages": pages,
+        }
 
     def _tool_hierarchy(self, args: dict) -> dict:
         db = Database(self.db_path)
@@ -390,6 +520,10 @@ class McpServer:
         force = bool(args.get("force", False))
         cleanup = args.get("cleanup")
         cleanup = bool(cleanup) if cleanup is not None else None
+        if args.get("chunk_size") is not None:
+            cfg.build.chunk_size = int(args["chunk_size"])
+        if args.get("chunk_overlap") is not None:
+            cfg.build.chunk_overlap = int(args["chunk_overlap"])
         bin_dir = ""
         if not cfg.sources:
             bin_dir = str(cfg.resolve_bin_dir() or "")
@@ -416,6 +550,13 @@ class McpServer:
                 meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
                 pages = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
                 links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+                has_chunks = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
+                ).fetchone()
+                chunks = (
+                    conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                    if has_chunks else 0
+                )
                 has_vectors = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors'"
                 ).fetchone()
@@ -425,7 +566,15 @@ class McpServer:
                 )
             finally:
                 conn.close()
-            index.update({"pages": pages, "links": links, "vectors": vectors, "meta": meta})
+            index.update(
+                {
+                    "pages": pages,
+                    "links": links,
+                    "chunks": chunks,
+                    "vectors": vectors,
+                    "meta": meta,
+                }
+            )
         bd = self.config.resolve_bin_dir()
         bin_dir = str(bd) if str(bd) not in ("", ".") else ""
         return {
@@ -479,10 +628,19 @@ def _apply_config_value(config: Config, key: str, value) -> None:
             config.search.backend = v
         elif parts[1] == "limit":
             config.search.limit = int(value)
+        elif parts[1] == "max_chunks_per_page":
+            config.search.max_chunks_per_page = int(value)
         else:
             raise KeyError(key)
-    elif head == "build" and len(parts) == 2 and parts[1] == "cleanup":
-        config.build.cleanup = _coerce_bool(value)
+    elif head == "build" and len(parts) == 2:
+        if parts[1] == "cleanup":
+            config.build.cleanup = _coerce_bool(value)
+        elif parts[1] == "chunk_size":
+            config.build.chunk_size = int(value)
+        elif parts[1] == "chunk_overlap":
+            config.build.chunk_overlap = int(value)
+        else:
+            raise KeyError(key)
     elif head == "bin_dir":
         config.bin_dir = Path(str(value))
     elif head == "lang":
@@ -492,7 +650,7 @@ def _apply_config_value(config: Config, key: str, value) -> None:
     elif head == "embedder" and len(parts) == 3 and parts[1] in ("index", "query"):
         target = config.embedder_index if parts[1] == "index" else config.embedder_query
         field = parts[2]
-        if field in ("dims", "batch_size", "embed_chars"):
+        if field in ("dims", "batch_size", "embed_chars", "threads"):
             setattr(target, field, int(value))
         elif field in ("model", "base_url", "api_key"):
             setattr(target, field, str(value))

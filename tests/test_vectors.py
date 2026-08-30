@@ -25,16 +25,14 @@ def _build(tmp_path):
     db = Database(tmp_path / "v.db")
     conn = db.connect()
     db.reset(conn)
-    pids = {}
     for fn, sec, kind, body in [
         ("Alpha", "objects", "page", "alpha text"),
         ("Beta", "objects", "page", "beta text"),
         ("Gamma", "lang", "member", "gamma text"),
     ]:
-        pids[fn] = db.insert_page(conn, fn, fn, sec, kind, "", "", body, fn, body)
-    db.insert_vector(conn, pids["Alpha"], _unit(1, 0, 0, 0))
-    db.insert_vector(conn, pids["Beta"], _unit(0, 1, 0, 0))
-    db.insert_vector(conn, pids["Gamma"], _unit(0, 0, 1, 0))
+        pid = db.insert_page(conn, fn, fn, sec, kind, "", "", body, fn, body)
+        cid = db.insert_chunk(conn, pid, 0, fn, body)
+        db.insert_vector(conn, cid, _unit(1, 0, 0, 0) if fn == "Alpha" else _unit(0, 1, 0, 0) if fn == "Beta" else _unit(0, 0, 1, 0))
     conn.commit()
     conn.close()
     return db.path
@@ -50,6 +48,35 @@ def test_vector_search_section_filter(tmp_path):
     backend = VectorBackend(_build(tmp_path), _FixedEmbedder())
     results = backend.search("query", limit=5, section="lang")
     assert [r.id for r in results] == ["Gamma"]
+
+
+def _build_multi_chunk(tmp_path):
+    """Одна страница с несколькими чанками, два одинаковых вектора."""
+    db = Database(tmp_path / "v2.db")
+    conn = db.connect()
+    db.reset(conn)
+    pid = db.insert_page(conn, "Big", "Big", "objects", "page", "", "",
+                         "big" * 2000, "Big", "big")
+    ids = [db.insert_chunk(conn, pid, i, "Big", f"chunk {i} big text") for i in range(4)]
+    for cid in ids:
+        db.insert_vector(conn, cid, _unit(1, 0, 0, 0))
+    pid2 = db.insert_page(conn, "Other", "Other", "objects", "page", "", "",
+                          "other", "Other", "other")
+    cid2 = db.insert_chunk(conn, pid2, 0, "Other", "other text")
+    db.insert_vector(conn, cid2, _unit(0, 1, 0, 0))
+    conn.commit()
+    conn.close()
+    return db.path
+
+
+def test_vector_dedup_per_page(tmp_path):
+    backend = VectorBackend(_build_multi_chunk(tmp_path), _FixedEmbedder())
+    results = backend.search("query", limit=10)
+    ids = [r.id for r in results]
+    # Other имеет выше косинус (вектор совпадает с запросом), Big ниже
+    assert ids.count("Big") == 2  # max_chunks_per_page по умолчанию
+    assert ids[-1] == "Big"
+    assert len(ids) == 3  # 2 чанка Big + 1 Other, несмотря на 4 вектора Big
 
 
 def test_hybrid_returns_fused(tmp_path):

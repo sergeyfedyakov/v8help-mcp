@@ -22,9 +22,10 @@ def make_backend(config, db_path) -> SearchBackend:
     from v8help.search.hybrid import HybridBackend
     from v8help.search.vectors import VectorBackend
 
+    mcp = config.search.max_chunks_per_page
     backend = (config.search.backend or "fts").lower()
     if backend == "vectors":
-        return VectorBackend(db_path, Embedder(_query_embedder(config)))
+        return VectorBackend(db_path, Embedder(_query_embedder(config)), max_chunks_per_page=mcp)
     if backend == "hybrid":
-        return HybridBackend(db_path, Embedder(_query_embedder(config)))
-    return FtsBackend(db_path)
+        return HybridBackend(db_path, Embedder(_query_embedder(config)), max_chunks_per_page=mcp)
+    return FtsBackend(db_path, max_chunks_per_page=mcp)

@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from v8help.config import EmbedderConfig
@@ -80,14 +82,59 @@ class Embedder:
         texts: list[str],
         batch_size: int | None = None,
         on_batch: BatchProgress | None = None,
+        threads: int = 1,
     ) -> list[list[float]]:
-        """Батчевая индексация с прогрессом ``on_batch(done, total)``."""
+        """Батчевая индексация с прогрессом ``on_batch(done, total)``.
+
+        При ``threads > 1`` батчи распределяются между пулом потоков (LM Studio
+        обрабатывает параллельные запросы), прогресс — через потокобезопасный
+        счётчик. Результаты возвращаются в исходном порядке.
+        """
         bs = batch_size or self.config.batch_size or 64
+        n = len(texts)
+        if n == 0:
+            return []
+        if threads <= 1:
+            return self._embed_sequential(texts, bs, on_batch)
+
+        out: list[list[float]] = [None] * n  # type: ignore[list-item]
+        lock = threading.Lock()
+        done = 0
+        nthreads = max(1, min(int(threads), n))
+        chunk = (n + nthreads - 1) // nthreads
+
+        def worker(start: int, end: int) -> None:
+            nonlocal done
+            i = start
+            while i < end:
+                vecs = self.embed(texts[i : i + bs])
+                with lock:
+                    out[i : i + bs] = vecs
+                    done += len(vecs)
+                    if on_batch is not None:
+                        on_batch(done, n)
+                i += bs
+
+        with ThreadPoolExecutor(max_workers=nthreads) as pool:
+            futures = [
+                pool.submit(worker, s, min(n, s + chunk))
+                for s in range(0, n, chunk)
+            ]
+            for f in futures:
+                f.result()
+        return out
+
+    def _embed_sequential(
+        self,
+        texts: list[str],
+        batch_size: int,
+        on_batch: BatchProgress | None,
+    ) -> list[list[float]]:
         out: list[list[float]] = []
-        for i in range(0, len(texts), bs):
-            out.extend(self.embed(texts[i : i + bs]))
+        for i in range(0, len(texts), batch_size):
+            out.extend(self.embed(texts[i : i + batch_size]))
             if on_batch is not None:
-                on_batch(min(len(texts), i + bs), len(texts))
+                on_batch(min(len(texts), i + batch_size), len(texts))
         return out
 
     def models(self) -> list[str]:

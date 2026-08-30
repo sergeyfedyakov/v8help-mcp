@@ -112,6 +112,24 @@ def test_tool_get_page(tmp_path):
     data = _result_payload(resp)
     assert data["section"] == "lang"
     assert "текст" in data["body"]
+    assert data["total_chunks"] == 1
+    assert data["truncated"] is False
+
+
+def test_tool_get_page_many(tmp_path):
+    server = McpServer(_build_tiny_index(tmp_path))
+    resp = _call(
+        server, 4, "get_page",
+        {"id": ["lang__def_String", "objects__catalog1", "нет_такой"]},
+    )
+    data = _result_payload(resp)
+    assert data["requested"] == 3
+    assert data["returned"] == 2
+    assert data["missing"] == ["нет_такой"]
+    assert data["truncated"] is False
+    names = [p["filename"] for p in data["pages"]]
+    assert names == ["lang__def_String", "objects__catalog1"]
+    assert data["pages"][0]["total_chunks"] == 1
 
 
 def test_tool_related(tmp_path):

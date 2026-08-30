@@ -58,6 +58,63 @@ def extract_title(text: str, filename: str) -> str:
     return stem
 
 
+_DESC_LINE_RE = re.compile(
+    r"^\s*\**\s*Описание(?:\s+варианта(?:\s+метода)?)?\s*:\s*\**\s*(.*)$",
+    re.IGNORECASE,
+)
+_SECTION_RE = re.compile(r"^[^\s|#>\-*\d`]+[^:]{0,60}:\s*$")
+_BOLD_SECTION_RE = re.compile(r"^\*\*[^*]+\*\*\s*$|^\*\*[^*]+:\*\*")
+
+
+def _is_section_line(s: str) -> bool:
+    """Строка-секция: 'Вариант синтаксиса: …', 'Синтаксис:', '**…:**'."""
+    if s.startswith("Вариант синтаксиса"):
+        return True
+    return bool(_SECTION_RE.match(s) or _BOLD_SECTION_RE.match(s))
+
+
+def extract_description(text: str) -> str:
+    """Возвращает текст секций описания статьи (пустая строка, если секций нет).
+
+    Собираются ВСЕ секции вида ``Описание:``, ``Описание варианта:``,
+    ``Описание варианта метода:`` (статьи с несколькими вариантами синтаксиса) —
+    каждая до ближайшей строки-секции (``…:``, ``Вариант синтаксиса: …``,
+    ``**…:**``, ``---``). Markdown-ссылки сворачиваются в текст.
+    """
+    lines = text.split("\n")
+    heads: list[int] = []
+    tails: list[str] = []
+    for i, line in enumerate(lines):
+        m = _DESC_LINE_RE.match(line)
+        if m:
+            heads.append(i)
+            tails.append(m.group(1).strip())
+    if not heads:
+        return ""
+
+    parts: list[str] = []
+    for k, desc_i in enumerate(heads):
+        j = desc_i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if tails[k]:
+            parts.append(tails[k])
+        while j < len(lines):
+            s = lines[j].strip()
+            if s == "---" or _is_section_line(s):
+                break
+            if s:
+                parts.append(s)
+            j += 1
+    if not parts:
+        return ""
+
+    txt = " ".join(parts)
+    txt = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", txt)
+    txt = txt.replace("**", "")
+    return re.sub(r"\s+", " ", txt).strip()
+
+
 def _strip_ext(name: str) -> str:
     if name.endswith(".md"):
         name = name[:-3]

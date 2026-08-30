@@ -28,17 +28,21 @@ class EmbedderConfig:
     dims: int = 0
     batch_size: int = 64
     embed_chars: int = 500
+    threads: int = 2
 
 
 @dataclass
 class SearchConfig:
     backend: str = "fts"
     limit: int = 10
+    max_chunks_per_page: int = 2
 
 
 @dataclass
 class BuildConfig:
     cleanup: bool = False
+    chunk_size: int = 1500
+    chunk_overlap: int = 200
 
 
 @dataclass
@@ -110,11 +114,16 @@ class Config:
             cfg.search = SearchConfig(
                 backend=s.get("backend", cfg.search.backend),
                 limit=int(s.get("limit", cfg.search.limit)),
+                max_chunks_per_page=int(
+                    s.get("max_chunks_per_page", cfg.search.max_chunks_per_page)
+                ),
             )
 
         build = data.get("build") or {}
         cfg.build = BuildConfig(
             cleanup=bool(build.get("cleanup", cfg.build.cleanup)),
+            chunk_size=int(build.get("chunk_size", cfg.build.chunk_size)),
+            chunk_overlap=int(build.get("chunk_overlap", cfg.build.chunk_overlap)),
         )
         return cfg
 
@@ -161,6 +170,7 @@ class Config:
                 "dims": e.dims,
                 "batch_size": e.batch_size,
                 "embed_chars": e.embed_chars,
+                "threads": e.threads,
             }
 
         d: dict = {
@@ -170,8 +180,16 @@ class Config:
             "lang": self.lang,
             "books": list(self.books),
             "include_english": self.include_english,
-            "search": {"backend": self.search.backend, "limit": self.search.limit},
-            "build": {"cleanup": self.build.cleanup},
+            "search": {
+                "backend": self.search.backend,
+                "limit": self.search.limit,
+                "max_chunks_per_page": self.search.max_chunks_per_page,
+            },
+            "build": {
+                "cleanup": self.build.cleanup,
+                "chunk_size": self.build.chunk_size,
+                "chunk_overlap": self.build.chunk_overlap,
+            },
             "embedder": {
                 "index": _emb(self.embedder_index),
                 "query": _emb(self.embedder_query),
@@ -199,6 +217,7 @@ def _embedder(data: dict) -> EmbedderConfig:
         dims=int(data.get("dims", 0)),
         batch_size=int(data.get("batch_size", 64)),
         embed_chars=int(data.get("embed_chars", 500)),
+        threads=int(data.get("threads", 2)),
     )
 
 

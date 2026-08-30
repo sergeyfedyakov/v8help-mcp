@@ -15,6 +15,10 @@ class SearchResult:
     section: str = ""
     kind: str = ""
     score: float = 0.0
+    chunk_id: int = 0
+    chunk_index: int = 0
+    total_chunks: int = 1
+    chunk_title: str = ""
 
 
 class SearchBackend(Protocol):

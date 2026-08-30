@@ -44,3 +44,61 @@ def test_normalize_target():
 def test_parse_links():
     body = "см. [Строка](lang__def_String.md) и [ИСТИНА](v8help://SyntaxHelperQueries/TRUE)"
     assert metadata.parse_links(body) == ["lang__def_String", "query__TRUE"]
+
+
+def test_extract_description_objects_format():
+    text = (
+        "# ЧтениеXML.Прочитать\n\n"
+        "Синтаксис:\n\n"
+        "Прочитать()\n\n"
+        "Описание:\n\n"
+        "Считывает очередной узел XML.\n"
+        "При этом [ТипУзла](ЧтениеXML.ТипУзла.md) обновляется.\n\n"
+        "Доступность:\n\n"
+        "Тонкий клиент.\n"
+    )
+    assert metadata.extract_description(text) == (
+        "Считывает очередной узел XML. При этом ТипУзла обновляется."
+    )
+
+
+def test_extract_description_lang_format():
+    text = "# Строка\n\n**Описание:**  \nЗначения данного типа содержат строку.\n\n**Литералы:**\nтекст\n"
+    assert metadata.extract_description(text) == (
+        "Значения данного типа содержат строку."
+    )
+
+
+def test_extract_description_inline_tail():
+    text = "# Ложь\n\n**Описание:** Литерал для указания значения.\n\n---\n"
+    assert metadata.extract_description(text) == "Литерал для указания значения."
+
+
+def test_extract_description_absent():
+    assert metadata.extract_description("# ACos\n\nФункция вычисляет косинус.\n") == ""
+    assert metadata.extract_description("# X\n\nОписание:\n\nДоступность:\n") == ""
+
+
+def test_extract_description_syntax_variants():
+    text = (
+        "# COMSafeArray.GetValue\n\n"
+        "Вариант синтаксиса: Список индексов\n\n"
+        "Синтаксис:\n\n"
+        "GetValue(<Индекс0>)\n\n"
+        "Описание варианта метода:\n\n"
+        "В параметрах указываются значения индексов.\n\n"
+        "Вариант синтаксиса: Массив индексов\n\n"
+        "Синтаксис:\n\n"
+        "GetValue(<Индексы>)\n\n"
+        "Описание варианта метода:\n\n"
+        "Все индексы перечислены в одном массиве.\n\n"
+        "Описание:\n\n"
+        "Получает значение элемента массива.\n\n"
+        "Доступность:\n\n"
+        "Сервер.\n"
+    )
+    assert metadata.extract_description(text) == (
+        "В параметрах указываются значения индексов. "
+        "Все индексы перечислены в одном массиве. "
+        "Получает значение элемента массива."
+    )
