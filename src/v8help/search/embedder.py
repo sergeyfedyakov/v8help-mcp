@@ -1,8 +1,13 @@
-"""Клиент эмбеддингов (OpenAI-совместимый ``/v1/embeddings``).
+"""Клиент эмбеддингов: OpenAI-совместимый ``/v1/embeddings`` или HF native pipeline.
 
-Работает через stdlib ``urllib`` (без requests). Поддерживает пакетный режим:
-``input`` передаётся массивом строк, сервер (LM Studio, Ollama, …) возвращает
-столько же векторов.
+Формат запроса задаётся явно в конфиге ``provider``:
+
+- ``"openai"`` (по умолчанию) — LM Studio, Ollama, облака: ``POST {base}/embeddings``
+  с ``{"model", "input": [...]}``, ответ ``{"data": [{"embedding": [...]}]}``.
+- ``"hf"`` — Hugging Face Inference native: ``POST {base}/{model}/pipeline/feature-extraction``
+  с ``{"inputs": [...]}``, ответ — список векторов.
+
+Работает через stdlib ``urllib`` (без requests). Поддерживает пакетный режим.
 """
 
 from __future__ import annotations
@@ -37,14 +42,18 @@ class Embedder:
     def configured(self) -> bool:
         return bool(self.config.base_url and self.config.model)
 
+    @property
+    def native_hf(self) -> bool:
+        """Native Hugging Face pipeline API (provider="hf")."""
+        return (self.config.provider or "openai").strip().lower() == "hf"
+
     def _headers(self) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
         if self.config.api_key:
             h["Authorization"] = f"Bearer {self.config.api_key}"
         return h
 
-    def _request(self, payload: dict) -> dict:
-        url = f"{self.base_url}/embeddings"
+    def _post_json(self, url: str, payload: dict) -> dict | list:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST", headers=self._headers())
         try:
@@ -62,8 +71,25 @@ class Embedder:
             return []
         if not self.configured:
             raise EmbedderError("Эмбеддер не настроен (нет model/base_url)")
-        data = self._request({"model": self.config.model, "input": texts})
-        vecs = [item["embedding"] for item in data.get("data", [])]
+        if self.native_hf:
+            url = (
+                f"{self.base_url}/{self.config.model}/pipeline/feature-extraction"
+            )
+            data = self._post_json(url, {"inputs": texts})
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                vecs = data
+            elif isinstance(data, list) and data and isinstance(data[0], float):
+                vecs = [data]
+            else:
+                raise EmbedderError(
+                    f"Неожиданный формат ответа {type(data).__name__} от {url}"
+                )
+        else:
+            url = f"{self.base_url}/embeddings"
+            data = self._post_json(url, {"model": self.config.model, "input": texts})
+            if not isinstance(data, dict):
+                raise EmbedderError(f"Неожиданный формат ответа от {url}")
+            vecs = [item["embedding"] for item in data.get("data", [])]
         if len(vecs) != len(texts):
             raise EmbedderError(
                 f"Ожидалось {len(texts)} векторов, получено {len(vecs)}"

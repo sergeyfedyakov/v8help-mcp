@@ -29,6 +29,7 @@ class EmbedderConfig:
     batch_size: int = 64
     embed_chars: int = 500
     threads: int = 2
+    provider: str = ""  # "openai" (по умолчанию) | "hf" (Hugging Face native pipeline)
 
 
 @dataclass
@@ -171,6 +172,7 @@ class Config:
                 "batch_size": e.batch_size,
                 "embed_chars": e.embed_chars,
                 "threads": e.threads,
+                "provider": e.provider,
             }
 
         d: dict = {
@@ -218,6 +220,7 @@ def _embedder(data: dict) -> EmbedderConfig:
         batch_size=int(data.get("batch_size", 64)),
         embed_chars=int(data.get("embed_chars", 500)),
         threads=int(data.get("threads", 2)),
+        provider=str(data.get("provider", "")),
     )
 
 

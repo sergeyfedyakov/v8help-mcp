@@ -652,7 +652,7 @@ def _apply_config_value(config: Config, key: str, value) -> None:
         field = parts[2]
         if field in ("dims", "batch_size", "embed_chars", "threads"):
             setattr(target, field, int(value))
-        elif field in ("model", "base_url", "api_key"):
+        elif field in ("model", "base_url", "api_key", "provider"):
             setattr(target, field, str(value))
         else:
             raise KeyError(key)

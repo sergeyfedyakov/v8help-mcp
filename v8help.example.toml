@@ -31,9 +31,10 @@ chunk_size = 1500     # целевой размер чанка при разби
 chunk_overlap = 200   # перекрытие соседних чанков
 
 # Эмбеддер для векторного/гибридного поиска (опционально).
-# OpenAI-совместимый API: LM Studio (http://localhost:1234/v1), Ollama
-# (http://localhost:11434/v1) и т.п. Модель должна быть одной и той же у index/query.
+# provider: "openai" (по умолчанию) — LM Studio, Ollama и прочие OpenAI-совместимые;
+#           "hf" — Hugging Face Inference native (router.huggingface.co, см. README).
 # [embedder.index]
+# provider = "openai"
 # model = "text-embedding-qwen3-embedding-0.6b"
 # base_url = "http://localhost:1234/v1"
 # api_key = ""
@@ -42,8 +43,8 @@ chunk_overlap = 200   # перекрытие соседних чанков
 # embed_chars = 500   # усечение тела страницы перед эмбеддингом (символов)
 
 # [embedder.query]
-# model = "text-embedding-qwen3-embedding-0.6b"
-# base_url = "http://localhost:1234/v1"
-# api_key = ""
+# provider = "hf"
+# model = "unsloth/Qwen3-Embedding-0.6B"
+# base_url = "https://router.huggingface.co/hf-inference/models"
+# api_key = "<HF_TOKEN>"
 # dims = 1024
-# batch_size = 64
