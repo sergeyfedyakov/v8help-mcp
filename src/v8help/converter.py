@@ -39,7 +39,7 @@ SCHEME_PREFIX = {
 
 V8HELP_RE = re.compile(
     r"^v8help://(SyntaxHelperContext|SyntaxHelperLanguage|"
-    r"SyntaxHelperQueries|SyntaxHelperCommonLanguage)/(.+?)(?:#(.+))?$",
+    r"SyntaxHelperQueries|SyntaxHelperCommonLanguage|dcsui)/(.+?)(?:#(.+))?$",
     re.IGNORECASE,
 )
 BROKEN_HREF_RE = re.compile(

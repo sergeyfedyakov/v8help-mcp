@@ -151,6 +151,12 @@ OpenAI-совместимого сервиса эмбеддингов.
                                         # скачает bge-m3 (1024 dims) и покажет конфиг
 ```
 
+Для Linux/macOS — bash-версия:
+
+```bash
+bash scripts/setup-ollama.sh            # то же самое (curl + официальный скрипт установки)
+```
+
 Скрипт выведет готовую секцию `[embedder.index]`/`[embedder.query]` для
 `v8help.toml` (или значения для MCP-тула `config_set`). После этого:
 

@@ -17,6 +17,7 @@ BOOK_META = {
     "shlang": ("lang__", "SyntaxHelperLanguage"),
     "shquery": ("query__", "SyntaxHelperQueries"),
     "shclang": ("clang__", "SyntaxHelperCommonLanguage"),
+    "dcsui": ("dcsui__", "dcsui"),
 }
 
 
@@ -446,7 +447,12 @@ def discover_embedders(timeout: float = 0.8) -> list[dict]:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception:
             continue
-        models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+        items = data.get("data") if isinstance(data, dict) else None
+        models = [
+            m.get("id", "")
+            for m in (items or [])
+            if isinstance(m, dict) and m.get("id")
+        ]
         if not models:
             continue
         out.append(

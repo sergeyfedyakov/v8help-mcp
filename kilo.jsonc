@@ -27,5 +27,6 @@
     "v8help": {
       "enabled": true
     }
-  }
+  },
+  "snapshot": false
 }

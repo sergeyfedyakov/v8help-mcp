@@ -6,6 +6,7 @@ def test_detect_section():
     assert metadata.detect_section("query__TRUE.md") == "query"
     assert metadata.detect_section("clang__hints.md") == "clang"
     assert metadata.detect_section("tables__x.md") == "tables"
+    assert metadata.detect_section("dcsui__form_QDWChooseGroupsDlg.md") == "objects"
     assert metadata.detect_section("Настройка.md") == "objects"
 
 
@@ -13,6 +14,7 @@ def test_detect_source():
     assert metadata.detect_source("lang__def_String.md") == "shlang_ru"
     assert metadata.detect_source("query__TRUE.md") == "shquery_ru"
     assert metadata.detect_source("clang__hints.md") == "shclang_ru"
+    assert metadata.detect_source("dcsui__form_QDWChooseGroupsDlg.md") == "dcsui_ru"
     assert metadata.detect_source("Настройка.md") == "shcntx_ru"
 
 
@@ -34,6 +36,7 @@ def test_normalize_target():
     assert metadata.normalize_target("v8help://SyntaxHelperQueries/query_totals.html") == "query__query_totals"
     assert metadata.normalize_target("v8help://SyntaxHelperLanguage/def_String") == "lang__def_String"
     assert metadata.normalize_target("v8help://SyntaxHelperContext/x") == "x"
+    assert metadata.normalize_target("v8help://dcsui/form_QDWChooseGroupsDlg") == "dcsui__form_QDWChooseGroupsDlg"
     assert metadata.normalize_target("v8help://SyntaxHelperCommonLanguage/hints#frag") == "clang__hints"
     assert metadata.normalize_target("Automation_сервер.md") == "Automation_сервер"
     assert metadata.normalize_target("page.md#anchor") == "page"

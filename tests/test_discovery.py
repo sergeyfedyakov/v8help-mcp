@@ -9,6 +9,7 @@ from v8help.config import (
     _parse_dotted_version,
     _parse_version,
     discover_bin_dir,
+    discover_embedders,
     discover_platforms,
     reset_discovery_cache,
 )
@@ -98,3 +99,24 @@ def test_resolve_sources_empty_books_no_discovery(monkeypatch):
     cfg = Config()
     cfg.books = []
     assert cfg.resolve_sources() == []
+
+
+def test_discover_embedders_tolerates_null_data(monkeypatch):
+    """Ollama на /v1/models отвечает {"object":"list","data":null} — не падаем."""
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"object":"list","data":null}'
+
+    monkeypatch.setattr(config_mod, "_embedders_cache", (False, []))
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=0.8: _Resp(),
+    )
+    assert discover_embedders() == []
