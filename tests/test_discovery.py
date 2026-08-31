@@ -6,6 +6,7 @@ from v8help.config import (
     _bin_dir_for,
     _fs_platform_bin_dirs,
     _is_1c_platform,
+    _linux_platform_dirs,
     _parse_dotted_version,
     _parse_version,
     discover_bin_dir,
@@ -64,6 +65,7 @@ def test_discover_picks_highest_with_hbk(tmp_path, monkeypatch):
     monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
     monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
     monkeypatch.setattr(config_mod, "_registry_1c_installs", lambda: [])
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path / "no1cv8"),))
     reset_discovery_cache()
 
     bd = discover_bin_dir()
@@ -83,6 +85,7 @@ def test_resolve_sources_uses_discovered_bin_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
     monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
     monkeypatch.setattr(config_mod, "_registry_1c_installs", lambda: [])
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path / "no1cv8"),))
     reset_discovery_cache()
 
     cfg = Config()
@@ -120,3 +123,38 @@ def test_discover_embedders_tolerates_null_data(monkeypatch):
         lambda req, timeout=0.8: _Resp(),
     )
     assert discover_embedders() == []
+
+
+def test_linux_platform_dirs(tmp_path, monkeypatch):
+    base = tmp_path / "1cv8"
+    for ver in ("8.3.27.2214", "8.5.1.1423"):
+        (base / "x86_64" / ver / "bin").mkdir(parents=True)
+        (base / "x86_64" / ver / "bin" / "1cv8").write_bytes(b"x")
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path),))
+    monkeypatch.setattr(config_mod, "shutil", type("S", (), {"which": lambda n: None}))
+    versions = {v for v, _ in _linux_platform_dirs()}
+    assert (8, 5, 1, 1423) in versions
+    assert (8, 3, 27, 2214) in versions
+
+
+def test_linux_platform_dirs_which(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "8.3.27.2214" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "1cv8").write_bytes(b"x")
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path / "none"),))
+    monkeypatch.setattr(config_mod, "shutil", type("S", (), {"which": lambda n: str(bin_dir / "1cv8")}))
+    dirs = _linux_platform_dirs()
+    assert len(dirs) == 1
+    assert dirs[0][0] == (8, 3, 27, 2214)
+
+
+def test_linux_platform_dirs_no_bin(tmp_path, monkeypatch):
+    """8.5.x: бинарники и .hbk прямо в каталоге версии, без подкаталога bin."""
+    ver = tmp_path / "1cv8" / "x86_64" / "8.5.1.1522"
+    ver.mkdir(parents=True)
+    (ver / "1cv8").write_bytes(b"x")
+    (ver / "shcntx_ru.hbk").write_bytes(b"x")
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path),))
+    monkeypatch.setattr(config_mod, "shutil", type("S", (), {"which": lambda n: None}))
+    dirs = _linux_platform_dirs()
+    assert dirs == [((8, 5, 1, 1522), ver)]

@@ -1,9 +1,9 @@
-"""MCP-сервер (stdio, JSON-RPC 2.0) поверх готовых модулей.
+"""MCP-сервер на FastMCP: транспорты stdio и streamable-http.
 
-Протокол MCP поверх транспорта stdio = newline-delimited JSON-RPC 2.0:
-по одному JSON-сообщению на строку, без вложенных переводов строк.
-
-Инструменты: search / get_page / hierarchy / related / build / build_status.
+Заменил ручной JSON-RPC (stdio-only) на FastMCP: инструменты регистрируются
+декоратором ``@mcp.tool()``, транспорт выбирается при запуске
+(``v8help-mcp`` / ``v8help serve`` — stdio, ``v8help serve --http`` —
+streamable-http на ``/mcp``).
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
+
+from fastmcp import FastMCP
 
 from v8help import __version__
 from v8help.config import Config, config_to_toml, discover_embedders, discover_platforms
@@ -25,12 +27,12 @@ from v8help.search.embedder import EmbedderError
 from v8help.search.fts import FtsBackend
 
 SERVER_NAME = "v8help"
-PROTOCOL_VERSION = "2024-11-05"
 
 # Статьи длиннее этого порога целиком не выдаются: только список чанков и первый чанк.
 _PAGE_CHARS_LIMIT = 4000
 
-# Корень проекта (для editable-установки: src/v8help/server.py -> parents[2]).
+# Корень проекта. Корректен при editable-установке (src/v8help/server.py ->
+# parents[2]); для wheel-установки конфиг задаётся явно (--config / V8HELP_CONFIG).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -41,183 +43,8 @@ def _resolve_paths(config: Config, base: Path) -> Config:
         config.db_path = base / config.db_path
     return config
 
-TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "search",
-        "description": (
-            "Полнотекстовый поиск по справке 1С (FTS5). Возвращает список страниц "
-            "с релевантностью (score) и сниппетами."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Поисковый запрос"},
-                "section": {
-                    "type": "string",
-                    "description": "Фильтр по разделу: objects/tables/lang/query/clang",
-                },
-                "kind": {
-                    "type": "string",
-                    "description": "Фильтр по kind: page/member/index",
-                },
-                "limit": {"type": "integer", "description": "Максимум результатов"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "get_page",
-        "description": (
-            "Полный текст страницы справки по идентификатору (filename без .md "
-            "или числовой id). id может быть строкой (одна страница) или массивом "
-            "строк (несколько страниц одним вызовом, 2-10 статей, пока суммарно "
-            "не превышено max_chars). Длинные статьи (>4000 символов) целиком НЕ "
-            "возвращаются: отдаётся список чанков и первый чанк; конкретный чанк "
-            "читается через chunk=N."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {
-                    "oneOf": [
-                        {"type": "string", "description": "Идентификатор страницы"},
-                        {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Несколько идентификаторов страниц",
-                        },
-                    ],
-                    "description": "Страница или список страниц",
-                },
-                "chunk": {
-                    "type": "integer",
-                    "description": "Номер чанка (0-based) для чтения части длинной статьи",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Лимит суммарного размера ответа (для массива id)",
-                },
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "hierarchy",
-        "description": (
-            "Оглавление: без section — сводка по разделам; с section — группы "
-            "страниц раздела (top-level объекты) с количеством."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "section": {"type": "string", "description": "Раздел для детализации"},
-            },
-        },
-    },
-    {
-        "name": "related",
-        "description": "Связанные страницы (исходящие и входящие ссылки) по id.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Идентификатор страницы"},
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "build",
-        "description": (
-            "Пересобрать индекс: распаковка .hbk -> консолидация md-корпуса -> "
-            "индексация FTS + чанкование. Выполняется асинхронно: возвращает job_id "
-            "сразу, результат и прогресс — через build_status. Может занять минуты. "
-            "Параметры chunk_size/chunk_overlap (в символах) задают размер чанка и "
-            "перекрытие при разбиении длинных статей."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "sources": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Источники для сборки (по умолчанию все из конфига)",
-                },
-                "lang": {
-                    "type": "string",
-                    "description": "Язык: ru/en (по умолчанию из конфига)",
-                },
-                "cleanup": {
-                    "type": "boolean",
-                    "description": "Удалить corpus после индексации",
-                },
-                "force": {
-                    "type": "boolean",
-                    "description": "Пересобрать даже если индекс актуален",
-                },
-                "chunk_size": {
-                    "type": "integer",
-                    "description": "Целевой размер чанка в символах (по умолчанию 1500)",
-                },
-                "chunk_overlap": {
-                    "type": "integer",
-                    "description": "Перекрытие соседних чанков в символах (по умолчанию 200)",
-                },
-            },
-        },
-    },
-    {
-        "name": "build_status",
-        "description": "Статус асинхронной сборки по job_id (running/done/error + прогресс).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "Идентификатор job из build"},
-            },
-            "required": ["job_id"],
-        },
-    },
-    {
-        "name": "discover",
-        "description": (
-            "Показать конфиг и автодискавери: каталог bin установленной платформы 1С "
-            "(реестр Uninstall/ФС), доступные эмбеддеры на localhost-портах "
-            "(LM Studio/Ollama) и состояние индекса."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "config_get",
-        "description": (
-            "Текущие настройки (эффективный конфиг): эмбеддер, search.backend, "
-            "bin_dir, книги и пр."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "config_set",
-        "description": (
-            "Изменить настройки и сохранить в v8help.toml (атомарно). Ключи: "
-            "search.backend (fts|hybrid|vectors), search.limit, "
-            "search.max_chunks_per_page, build.cleanup, build.chunk_size, "
-            "build.chunk_overlap, "
-            "embedder.index/query.{model,base_url,api_key,dims,batch_size,embed_chars,threads}, "
-            "bin_dir, lang, books."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "values": {
-                    "type": "object",
-                    "description": "Плоские ключи -> значения",
-                },
-            },
-            "required": ["values"],
-        },
-    },
-]
 
-
-def _lookup(conn, identifier: Any):
+def _lookup(conn, identifier: Any) -> sqlite3.Row | None:
     ident = str(identifier)
     if ident.isdigit():
         return conn.execute(
@@ -228,98 +55,22 @@ def _lookup(conn, identifier: Any):
     ).fetchone()
 
 
-def _json_rpc_result(msg_id: Any, result: Any) -> dict:
-    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+class _Tools:
+    """Обработчики инструментов MCP (закрыты поверх готовой БД)."""
 
-
-def _json_rpc_error(msg_id: Any, code: int, message: str) -> dict:
-    return {
-        "jsonrpc": "2.0",
-        "id": msg_id,
-        "error": {"code": code, "message": message},
-    }
-
-
-class McpServer:
     def __init__(self, config: Config, config_path: str | None = None) -> None:
         self.config = config
         self.config_path = config_path
         self.db_path = Path(config.db_path)
 
-    def handle_message(self, msg: dict) -> dict | None:
-        """Возвращает JSON-RPC ответ (dict) для записи, либо None для нотификаций."""
-        method = msg.get("method")
-        msg_id = msg.get("id")
-        if method is None:
-            return _json_rpc_error(msg_id, -32600, "Invalid Request")
-        if "id" not in msg:
-            return None
+    # --- search ---
 
-        if method == "initialize":
-            return _json_rpc_result(
-                msg_id,
-                {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": SERVER_NAME, "version": __version__},
-                },
-            )
-        if method == "ping":
-            return _json_rpc_result(msg_id, {})
-        if method == "tools/list":
-            return _json_rpc_result(msg_id, {"tools": TOOLS})
-        if method == "tools/call":
-            return self._handle_tool_call(msg_id, msg.get("params") or {})
-        if method == "resources/list":
-            return _json_rpc_result(msg_id, {"resources": []})
-        if method == "prompts/list":
-            return _json_rpc_result(msg_id, {"prompts": []})
-        return _json_rpc_error(msg_id, -32601, f"Method not found: {method}")
-
-    def _handle_tool_call(self, msg_id: Any, params: dict) -> dict:
-        name = params.get("name", "")
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            arguments = {}
-        handler = _TOOL_HANDLERS.get(name)
-        if handler is None:
-            return _json_rpc_error(msg_id, -32602, f"Unknown tool: {name}")
-        try:
-            data = handler(self, arguments)
-            return _json_rpc_result(
-                msg_id,
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(data, ensure_ascii=False, indent=2),
-                        }
-                    ],
-                    "isError": False,
-                },
-            )
-        except Exception as exc:
-            return _json_rpc_result(
-                msg_id,
-                {
-                    "content": [{"type": "text", "text": f"Ошибка: {exc}"}],
-                    "isError": True,
-                },
-            )
-
-    # --- инструменты ---
-
-    def _tool_search(self, args: dict) -> dict:
-        limit = int(args.get("limit") or self.config.search.limit)
-        query = str(args["query"])
-        section = args.get("section")
-        kind = args.get("kind")
+    def search(self, query, section=None, kind=None, limit=None) -> dict:
+        limit = int(limit or self.config.search.limit)
         backend = make_backend(self.config, self.db_path)
         name = (self.config.search.backend or "fts").lower()
         try:
-            results = backend.search(
-                query, limit=limit, section=section, kind=kind
-            )
+            results = backend.search(query, limit=limit, section=section, kind=kind)
             used = name
         except (EmbedderError, sqlite3.OperationalError):
             # Нет эмбеддера/векторов — деградируем на FTS.
@@ -333,14 +84,15 @@ class McpServer:
             "results": [dataclasses.asdict(r) for r in results],
         }
 
-    def _tool_get_page(self, args: dict) -> dict:
-        max_chars = int(args.get("max_chars") or 4000)
-        chunk_index = args.get("chunk")
-        ids = args.get("id")
-        if isinstance(ids, list):
-            return self._get_pages_many(ids, max_chars)
-        if isinstance(ids, str):
-            return self._get_page_one(ids, chunk_index)
+    # --- get_page ---
+
+    def get_page(self, ident, chunk=None, max_chars: int = 4000) -> dict:
+        max_chars = int(max_chars or 4000)
+        chunk_index = chunk
+        if isinstance(ident, list):
+            return self._get_pages_many(ident, max_chars)
+        if isinstance(ident, str):
+            return self._get_page_one(ident, chunk_index)
         raise ValueError("id должен быть строкой или массивом строк")
 
     def _get_page_one(self, ident: str, chunk_index=None) -> dict:
@@ -349,7 +101,7 @@ class McpServer:
         try:
             page = _lookup(conn, ident)
             if page is None:
-                raise KeyError(f"Страница не найдена: {ident}")
+                raise ValueError(f"Страница не найдена: {ident}")
             has_chunks = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
             ).fetchone()
@@ -384,7 +136,7 @@ class McpServer:
             if chunk_index is not None:
                 row = next((c for c in chunks if c["chunk_index"] == int(chunk_index)), None)
                 if row is None:
-                    raise KeyError(
+                    raise ValueError(
                         f"Чанк {chunk_index} не найден (всего {total})"
                     )
                 body = conn.execute(
@@ -429,7 +181,7 @@ class McpServer:
                 break
             try:
                 page = self._get_page_one(str(ident))
-            except KeyError:
+            except ValueError:
                 missing.append(str(ident))
                 continue
             total_chars += len(page["body"])
@@ -445,11 +197,12 @@ class McpServer:
             "pages": pages,
         }
 
-    def _tool_hierarchy(self, args: dict) -> dict:
+    # --- hierarchy / related ---
+
+    def hierarchy(self, section=None) -> dict:
         db = Database(self.db_path)
         conn = db.connect()
         try:
-            section = args.get("section")
             if section:
                 rows = conn.execute(
                     "SELECT filename FROM pages WHERE section=? ORDER BY filename",
@@ -477,13 +230,13 @@ class McpServer:
         finally:
             conn.close()
 
-    def _tool_related(self, args: dict) -> dict:
+    def related(self, id) -> dict:
         db = Database(self.db_path)
         conn = db.connect()
         try:
-            row = _lookup(conn, args["id"])
+            row = _lookup(conn, id)
             if row is None:
-                raise KeyError(f"Страница не найдена: {args['id']}")
+                raise ValueError(f"Страница не найдена: {id}")
             fname = row["filename"]
             out = [
                 r["dst"]
@@ -506,24 +259,25 @@ class McpServer:
         finally:
             conn.close()
 
-    def _tool_build(self, args: dict) -> dict:
+    # --- build / build_status ---
+
+    def build(self, sources=None, lang=None, cleanup=None, force=False,
+              chunk_size=None, chunk_overlap=None) -> dict:
         cfg = dataclasses.replace(self.config)
-        ids = args.get("sources")
-        if ids:
-            idset = {str(x) for x in ids}
+        if sources:
+            idset = {str(x) for x in sources}
             if cfg.sources:
                 cfg.sources = [s for s in cfg.sources if s.id in idset]
             else:
                 cfg.books = [b for b in cfg.books if b in idset]
-        if args.get("lang"):
-            cfg.lang = str(args["lang"])
-        force = bool(args.get("force", False))
-        cleanup = args.get("cleanup")
+        if lang:
+            cfg.lang = str(lang)
+        force = bool(force)
         cleanup = bool(cleanup) if cleanup is not None else None
-        if args.get("chunk_size") is not None:
-            cfg.build.chunk_size = int(args["chunk_size"])
-        if args.get("chunk_overlap") is not None:
-            cfg.build.chunk_overlap = int(args["chunk_overlap"])
+        if chunk_size is not None:
+            cfg.build.chunk_size = int(chunk_size)
+        if chunk_overlap is not None:
+            cfg.build.chunk_overlap = int(chunk_overlap)
         bin_dir = ""
         if not cfg.sources:
             bin_dir = str(cfg.resolve_bin_dir() or "")
@@ -535,13 +289,15 @@ class McpServer:
         job = get_manager().start(cfg, force=force, cleanup=cleanup)
         return {"job_id": job.id, "status": "started", "bin_dir": bin_dir}
 
-    def _tool_build_status(self, args: dict) -> dict:
-        job = get_manager().status(str(args["job_id"]))
+    def build_status(self, job_id: str) -> dict:
+        job = get_manager().status(str(job_id))
         if job is None:
-            raise KeyError(f"Job не найден: {args['job_id']}")
+            raise ValueError(f"Job не найден: {job_id}")
         return job.as_dict()
 
-    def _tool_discover(self, args: dict) -> dict:
+    # --- discover / config ---
+
+    def discover(self) -> dict:
         db = Database(self.db_path)
         index: dict = {"exists": db.exists()}
         if db.exists():
@@ -586,11 +342,10 @@ class McpServer:
             "index": index,
         }
 
-    def _tool_config_get(self, args: dict) -> dict:
+    def config_get(self) -> dict:
         return self.config.to_dict()
 
-    def _tool_config_set(self, args: dict) -> dict:
-        values = args.get("values") or {}
+    def config_set(self, values: dict) -> dict:
         if not isinstance(values, dict):
             raise ValueError("values должен быть объектом key=value")
         for key, value in values.items():
@@ -660,91 +415,208 @@ def _apply_config_value(config: Config, key: str, value) -> None:
         raise KeyError(key)
 
 
-_TOOL_HANDLERS = {
-    "search": McpServer._tool_search,
-    "get_page": McpServer._tool_get_page,
-    "hierarchy": McpServer._tool_hierarchy,
-    "related": McpServer._tool_related,
-    "build": McpServer._tool_build,
-    "build_status": McpServer._tool_build_status,
-    "discover": McpServer._tool_discover,
-    "config_get": McpServer._tool_config_get,
-    "config_set": McpServer._tool_config_set,
-}
+def build_server(config: Config, config_path: str | None = None) -> FastMCP:
+    """Собирает FastMCP-сервер с 9 инструментами поверх готового Config."""
+    tools = _Tools(config, config_path)
+    mcp = FastMCP(SERVER_NAME, version=__version__)
+
+    @mcp.tool()
+    def search(
+        query: str,
+        section: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> dict:
+        """Полнотекстовый поиск по справке 1С (FTS5).
+
+        Возвращает список страниц с релевантностью (score) и сниппетами.
+
+        Args:
+            query: Поисковый запрос.
+            section: Фильтр по разделу: objects/tables/lang/query/clang.
+            kind: Фильтр по kind: page/member/index.
+            limit: Максимум результатов.
+        """
+        return tools.search(query, section=section, kind=kind, limit=limit)
+
+    @mcp.tool()
+    def get_page(
+        id: str | list[str],
+        chunk: int | None = None,
+        max_chars: int | None = None,
+    ) -> dict:
+        """Полный текст страницы справки по идентификатору (filename без .md или числовой id).
+
+        id может быть строкой (одна страница) или массивом строк (несколько страниц
+        одним вызовом, 2-10 статей, пока суммарно не превышено max_chars). Длинные
+        статьи (>4000 символов) целиком НЕ возвращаются: отдаётся список чанков и
+        первый чанк; конкретный чанк читается через chunk=N.
+
+        Args:
+            id: Страница или список страниц.
+            chunk: Номер чанка (0-based) для чтения части длинной статьи.
+            max_chars: Лимит суммарного размера ответа (для массива id).
+        """
+        return tools.get_page(id, chunk=chunk, max_chars=max_chars)
+
+    @mcp.tool()
+    def hierarchy(section: str | None = None) -> dict:
+        """Оглавление: без section — сводка по разделам; с section — группы страниц раздела.
+
+        Args:
+            section: Раздел для детализации (objects/tables/lang/query/clang).
+        """
+        return tools.hierarchy(section=section)
+
+    @mcp.tool()
+    def related(id: str) -> dict:
+        """Связанные страницы (исходящие и входящие ссылки) по id.
+
+        Args:
+            id: Идентификатор страницы (filename или числовой id).
+        """
+        return tools.related(id)
+
+    @mcp.tool()
+    def build(
+        sources: list[str] | None = None,
+        lang: str | None = None,
+        cleanup: bool | None = None,
+        force: bool | None = None,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+    ) -> dict:
+        """Пересобрать индекс: распаковка .hbk -> консолидация md-корпуса -> индексация.
+
+        Выполняется асинхронно: возвращает job_id сразу, результат и прогресс — через
+        build_status. Может занять минуты.
+
+        Args:
+            sources: Источники для сборки (по умолчанию все из конфига).
+            lang: Язык: ru/en (по умолчанию из конфига).
+            cleanup: Удалить corpus после индексации.
+            force: Пересобрать даже если индекс актуален.
+            chunk_size: Целевой размер чанка в символах (по умолчанию 1500).
+            chunk_overlap: Перекрытие соседних чанков в символах (по умолчанию 200).
+        """
+        return tools.build(
+            sources=sources, lang=lang, cleanup=cleanup, force=force,
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+        )
+
+    @mcp.tool()
+    def build_status(job_id: str) -> dict:
+        """Статус асинхронной сборки по job_id (running/done/error + прогресс).
+
+        Args:
+            job_id: Идентификатор job из build.
+        """
+        return tools.build_status(job_id)
+
+    @mcp.tool()
+    def discover() -> dict:
+        """Показать конфиг и автодискавери.
+
+        Каталог bin установленной платформы 1С (реестр Uninstall/ФС), доступные
+        эмбеддеры на localhost-портах (LM Studio/Ollama) и состояние индекса.
+        """
+        return tools.discover()
+
+    @mcp.tool()
+    def config_get() -> dict:
+        """Текущие настройки (эффективный конфиг): эмбеддер, search.backend, bin_dir, книги."""
+        return tools.config_get()
+
+    @mcp.tool()
+    def config_set(values: dict[str, Any]) -> dict:
+        """Изменить настройки и сохранить в v8help.toml (атомарно).
+
+        Ключи: search.backend (fts|hybrid|vectors), search.limit,
+        search.max_chunks_per_page, build.cleanup, build.chunk_size,
+        build.chunk_overlap, embedder.index/query.{model,base_url,api_key,dims,
+        batch_size,embed_chars,threads}, bin_dir, lang, books.
+
+        Args:
+            values: Плоские ключи -> значения.
+        """
+        return tools.config_set(values)
+
+    return mcp
 
 
-def _write(stdout: TextIO, obj: dict) -> None:
-    stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    stdout.flush()
+def load_config(config_arg: str | None) -> tuple[Config, str | None]:
+    """Загрузка конфига. Порядок: --config > V8HELP_CONFIG > ./v8help.toml
+    > PROJECT_ROOT/v8help.toml > defaults. Возвращает (config, config_path)."""
+    path = config_arg
+    if not path:
+        env = os.environ.get("V8HELP_CONFIG")
+        if env:
+            path = env
+    if path:
+        p = Path(path)
+        if p.exists():
+            try:
+                return Config.load(p), str(p)
+            except Exception as exc:
+                print(f"[v8help] ошибка чтения {p}: {exc}", file=sys.stderr)
+                return Config(), None
+        print(f"[v8help] config не найден: {p} — использую defaults", file=sys.stderr)
+        return Config(), None
+    for cand in (Path.cwd() / "v8help.toml", PROJECT_ROOT / "v8help.toml"):
+        if cand.exists():
+            try:
+                return Config.load(cand), str(cand)
+            except Exception as exc:
+                print(f"[v8help] ошибка чтения {cand}: {exc}", file=sys.stderr)
+                return Config(), None
+    return Config(), None
 
 
-def _reconfigure_utf8(stream: TextIO) -> None:
-    try:
-        stream.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError, OSError):
-        pass
-
-
-def run(
+def serve(
     config: Config,
-    stdin: TextIO | None = None,
-    stdout: TextIO | None = None,
     config_path: str | None = None,
+    *,
+    http: bool = False,
+    host: str | None = None,
+    port: int | None = None,
 ) -> int:
-    if stdin is None:
-        _reconfigure_utf8(sys.stdin)
-        stdin = sys.stdin
-    if stdout is None:
-        _reconfigure_utf8(sys.stdout)
-        stdout = sys.stdout
-    _reconfigure_utf8(sys.stderr)
-    server = McpServer(config, config_path=config_path)
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            _write(stdout, _json_rpc_error(None, -32700, "Parse error"))
-            continue
-        try:
-            resp = server.handle_message(msg)
-        except Exception as exc:
-            resp = _json_rpc_error(msg.get("id"), -32603, str(exc))
-        if resp is not None:
-            _write(stdout, resp)
+    """Запускает MCP-сервер: stdio (по умолчанию) или streamable-http."""
+    base = Path(config_path).resolve().parent if config_path else PROJECT_ROOT
+    config = _resolve_paths(config, base)
+    mcp = build_server(config, config_path)
+    if http:
+        mcp.run(transport="http", host=host, port=port, show_banner=False)
+    else:
+        mcp.run(transport="stdio", show_banner=False)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    config_path = None
-    if "--config" in argv:
-        i = argv.index("--config")
-        if i + 1 < len(argv):
-            config_path = argv[i + 1]
-    config: Config | None = None
-    if config_path:
-        try:
-            config = Config.load(config_path)
-        except FileNotFoundError:
-            print(f"[v8help] config не найден: {config_path} — использую defaults", file=sys.stderr)
-            config_path = None
-    if config is None:
-        # По умолчанию подхватываем PROJECT_ROOT/v8help.toml (создаётся config_set).
-        default_cfg = PROJECT_ROOT / "v8help.toml"
-        if default_cfg.exists():
-            try:
-                config = Config.load(default_cfg)
-                config_path = str(default_cfg)
-            except Exception as exc:
-                print(f"[v8help] ошибка чтения {default_cfg}: {exc}", file=sys.stderr)
-                config = Config()
-        else:
-            config = Config()
-    base = Path(config_path).resolve().parent if config_path else PROJECT_ROOT
-    return run(_resolve_paths(config, base), config_path=config_path)
+    config_arg: str | None = None
+    http = False
+    host: str | None = None
+    port: int | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--config" and i + 1 < len(argv):
+            config_arg = argv[i + 1]
+            i += 2
+            continue
+        if a == "--http":
+            http = True
+        elif a == "--host" and i + 1 < len(argv):
+            host = argv[i + 1]
+            i += 2
+            continue
+        elif a == "--port" and i + 1 < len(argv):
+            port = int(argv[i + 1])
+            i += 2
+            continue
+        i += 1
+    config, config_path = load_config(config_arg)
+    return serve(config, config_path, http=http, host=host, port=port)
 
 
 if __name__ == "__main__":

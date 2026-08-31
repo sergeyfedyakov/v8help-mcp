@@ -1,14 +1,22 @@
 """Интеграционные тесты: чанкование в индексе, поиск по чанкам, get_page с chunk."""
 
+import asyncio
+import json
 from pathlib import Path
 
 import sqlite3
+
+from fastmcp import Client
 
 from v8help.config import Config
 from v8help.db import Database
 from v8help.indexer import build_index
 from v8help.search.fts import FtsBackend
-from v8help.server import McpServer
+from v8help.server import build_server
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def _make_corpus(tmp_path) -> Path:
@@ -109,50 +117,53 @@ def test_fts_dedup_limit_per_page(tmp_path):
 
 def test_get_page_long_returns_first_chunk_only(tmp_path):
     config = _build(tmp_path)
-    server = McpServer(config)
-    resp = server.handle_message({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {
-            "name": "get_page",
-            "arguments": {"id": "Глобальный_контекст.ДлиннаяФункция"},
-        },
-    })
-    assert resp["result"]["isError"] is False
-    import json
-    data = json.loads(resp["result"]["content"][0]["text"])
-    assert data["total_chunks"] > 1
-    assert data["truncated"] is True
-    assert data["chunk_index"] == 0
-    assert len(data["body"]) <= 1500 + 80
-    assert len(data["chunks"]) == data["total_chunks"]
+    mcp = build_server(config, None)
+
+    async def main():
+        async with Client(mcp) as client:
+            res = await client.call_tool(
+                "get_page", {"id": "Глобальный_контекст.ДлиннаяФункция"},
+                raise_on_error=False,
+            )
+            assert res.is_error is False
+            data = json.loads(res.content[0].text)
+            assert data["total_chunks"] > 1
+            assert data["truncated"] is True
+            assert data["chunk_index"] == 0
+            assert len(data["body"]) <= 1500 + 80
+            assert len(data["chunks"]) == data["total_chunks"]
+
+    _run(main())
 
 
 def test_get_page_chunk_n(tmp_path):
     config = _build(tmp_path)
-    server = McpServer(config)
-    import json
+    mcp = build_server(config, None)
 
-    def call(iid, args):
-        resp = server.handle_message({
-            "jsonrpc": "2.0", "id": iid, "method": "tools/call",
-            "params": {"name": "get_page", "arguments": args},
-        })
-        return json.loads(resp["result"]["content"][0]["text"])
+    async def main():
+        async with Client(mcp) as client:
+            r0 = await client.call_tool(
+                "get_page", {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 0},
+                raise_on_error=False,
+            )
+            r1 = await client.call_tool(
+                "get_page", {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 1},
+                raise_on_error=False,
+            )
+            assert r0.is_error is False and r1.is_error is False
+            data0 = json.loads(r0.content[0].text)
+            data1 = json.loads(r1.content[0].text)
+            assert data0["chunk_index"] == 0
+            assert data1["chunk_index"] == 1
+            assert data0["body"] != data1["body"]
+            # выход за границы — ошибка
+            bad = await client.call_tool(
+                "get_page", {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 999},
+                raise_on_error=False,
+            )
+            assert bad.is_error is True
 
-    data0 = call(1, {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 0})
-    data1 = call(2, {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 1})
-    assert data0["chunk_index"] == 0
-    assert data1["chunk_index"] == 1
-    assert data0["body"] != data1["body"]
-    # выход за границы — ошибка
-    bad = server.handle_message({
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {
-            "name": "get_page",
-            "arguments": {"id": "Глобальный_контекст.ДлиннаяФункция", "chunk": 999},
-        },
-    })
-    assert bad["result"]["isError"] is True
+    _run(main())
 
 
 def test_sqlite_schema_has_chunks(tmp_path):

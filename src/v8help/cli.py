@@ -47,15 +47,26 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("related", help="связанные страницы")
     p.add_argument("id", help="идентификатор страницы")
 
-    sub.add_parser("serve", help="запустить MCP-сервер")
+    p = sub.add_parser("serve", help="запустить MCP-сервер (stdio или --http)")
+    p.add_argument("--http", action="store_true", help="HTTP-транспорт (streamable-http) вместо stdio")
+    p.add_argument("--host", default=None, help="адрес для HTTP (по умолчанию 127.0.0.1)")
+    p.add_argument("--port", type=int, default=None, help="порт для HTTP (по умолчанию 8000)")
 
     return parser
+
+
+def _load_config(config_arg: str | None) -> Config:
+    """Загрузка конфига с учётом V8HELP_CONFIG/env — та же логика, что в server.load_config."""
+    from v8help import server
+
+    config, _ = server.load_config(config_arg)
+    return config
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = Config.load(args.config)
+    config = _load_config(args.config)
     handler = HANDLERS.get(args.command)
     if handler is None:
         parser.error(f"неизвестная команда: {args.command}")
@@ -217,9 +228,16 @@ def _related(args, config: Config) -> int:
 
 
 def _serve(args, config: Config) -> int:
-    from v8help.server import PROJECT_ROOT, _resolve_paths, run
+    from v8help import server
 
-    return run(_resolve_paths(config, PROJECT_ROOT))
+    cfg, config_path = server.load_config(args.config)
+    return server.serve(
+        cfg,
+        config_path=config_path,
+        http=args.http,
+        host=args.host,
+        port=args.port,
+    )
 
 
 HANDLERS = {

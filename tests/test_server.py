@@ -1,9 +1,26 @@
-import io
+"""Интеграционные тесты MCP-сервера (FastMCP): in-memory, stdio e2e, HTTP."""
+
+import asyncio
 import json
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import uvicorn
+from fastmcp import Client
 
 from v8help.config import Config
 from v8help.indexer import build_index
-from v8help.server import McpServer, run
+from v8help.server import build_server
+
+TOOL_NAMES = {
+    "search", "get_page", "hierarchy", "related", "build", "build_status",
+    "discover", "config_get", "config_set",
+}
 
 
 def _build_tiny_index(tmp_path):
@@ -29,188 +46,321 @@ def _build_tiny_index(tmp_path):
     return config
 
 
-def _init_msg(iid):
-    return {
-        "jsonrpc": "2.0",
-        "id": iid,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0"},
-        },
-    }
+def _make_server(tmp_path, config_path=None):
+    return build_server(_build_tiny_index(tmp_path), config_path)
 
 
-def test_initialize(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = server.handle_message(_init_msg(1))
-    assert resp["id"] == 1
-    assert resp["result"]["protocolVersion"] == "2024-11-05"
-    assert resp["result"]["serverInfo"]["name"] == "v8help"
-    assert "tools" in resp["result"]["capabilities"]
+def _run(coro):
+    return asyncio.run(coro)
 
 
-def test_notification_returns_none(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = server.handle_message(
-        {"jsonrpc": "2.0", "method": "notifications/initialized"}
-    )
-    assert resp is None
+async def _call_ok(client, name, args=None):
+    res = await client.call_tool(name, args or {}, raise_on_error=False)
+    assert res.is_error is False, res.content[0].text
+    return json.loads(res.content[0].text)
+
+
+# ---------- in-memory (Client над build_server) ----------
 
 
 def test_tools_list(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = server.handle_message(
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-    )
-    names = {t["name"] for t in resp["result"]["tools"]}
-    assert names == {
-        "search", "get_page", "hierarchy", "related", "build", "build_status",
-        "discover", "config_get", "config_set",
-    }
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            names = {t.name for t in await client.list_tools()}
+            assert names == TOOL_NAMES
+
+    _run(main())
+
+
+def test_initialize_server_info(tmp_path):
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            info = client.server_info
+            assert info.name == "v8help"
+
+    _run(main())
 
 
 def test_tool_discover(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 20, "discover", {})
-    data = _result_payload(resp)
-    assert data["index"]["exists"] is True
-    assert data["index"]["pages"] == 3
-    assert "bin_dir" in data
-    assert "platforms" in data
-    assert data["config"]["books"] == []
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(client, "discover")
+            assert data["index"]["exists"] is True
+            assert data["index"]["pages"] == 3
+            assert "bin_dir" in data
+            assert "platforms" in data
+            assert data["config"]["books"] == []
 
-
-def _call(server, iid, name, arguments=None):
-    return server.handle_message(
-        {
-            "jsonrpc": "2.0",
-            "id": iid,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments or {}},
-        }
-    )
-
-
-def _result_payload(resp):
-    assert resp["result"]["isError"] is False, resp
-    return json.loads(resp["result"]["content"][0]["text"])
+    _run(main())
 
 
 def test_tool_search_split(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 3, "search", {"query": "регулярному"})
-    data = _result_payload(resp)
-    ids = [r["id"] for r in data["results"]]
-    assert "Глобальный_контекст.СтрНайтиПоРегулярномуВыражению" in ids
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(client, "search", {"query": "регулярному"})
+            ids = [r["id"] for r in data["results"]]
+            assert "Глобальный_контекст.СтрНайтиПоРегулярномуВыражению" in ids
+
+    _run(main())
 
 
 def test_tool_get_page(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 4, "get_page", {"id": "lang__def_String"})
-    data = _result_payload(resp)
-    assert data["section"] == "lang"
-    assert "текст" in data["body"]
-    assert data["total_chunks"] == 1
-    assert data["truncated"] is False
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(client, "get_page", {"id": "lang__def_String"})
+            assert data["section"] == "lang"
+            assert "текст" in data["body"]
+            assert data["total_chunks"] == 1
+            assert data["truncated"] is False
+
+    _run(main())
 
 
 def test_tool_get_page_many(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(
-        server, 4, "get_page",
-        {"id": ["lang__def_String", "objects__catalog1", "нет_такой"]},
-    )
-    data = _result_payload(resp)
-    assert data["requested"] == 3
-    assert data["returned"] == 2
-    assert data["missing"] == ["нет_такой"]
-    assert data["truncated"] is False
-    names = [p["filename"] for p in data["pages"]]
-    assert names == ["lang__def_String", "objects__catalog1"]
-    assert data["pages"][0]["total_chunks"] == 1
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(
+                client, "get_page",
+                {"id": ["lang__def_String", "objects__catalog1", "нет_такой"]},
+            )
+            assert data["requested"] == 3
+            assert data["returned"] == 2
+            assert data["missing"] == ["нет_такой"]
+            assert data["truncated"] is False
+            names = [p["filename"] for p in data["pages"]]
+            assert names == ["lang__def_String", "objects__catalog1"]
+            assert data["pages"][0]["total_chunks"] == 1
+
+    _run(main())
 
 
 def test_tool_related(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 5, "related", {"id": "objects__catalog1"})
-    data = _result_payload(resp)
-    assert data["outgoing"] == ["lang__def_String"]
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(client, "related", {"id": "objects__catalog1"})
+            assert data["outgoing"] == ["lang__def_String"]
+
+    _run(main())
 
 
 def test_tool_get_page_missing(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 6, "get_page", {"id": "нет_такой"})
-    assert resp["result"]["isError"] is True
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            res = await client.call_tool(
+                "get_page", {"id": "нет_такой"}, raise_on_error=False
+            )
+            assert res.is_error is True
+
+    _run(main())
 
 
 def test_tool_config_get(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 40, "config_get", {})
-    data = _result_payload(resp)
-    assert data["search"]["backend"] == "fts"
-    assert "embedder" in data
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            data = await _call_ok(client, "config_get")
+            assert data["search"]["backend"] == "fts"
+            assert "embedder" in data
+
+    _run(main())
 
 
 def test_tool_config_set_persists(tmp_path):
     config = _build_tiny_index(tmp_path)
     config_path = str(tmp_path / "v8help.toml")
-    server = McpServer(config, config_path=config_path)
-    resp = _call(
-        server, 41, "config_set",
-        {"values": {"search.backend": "hybrid", "search.limit": 25}},
-    )
-    data = _result_payload(resp)
-    assert data["config"]["search"]["backend"] == "hybrid"
-    assert data["config"]["search"]["limit"] == 25
-    from pathlib import Path
+    mcp = build_server(config, config_path)
 
-    assert Path(config_path).exists()
-    loaded = Config.load(config_path)
-    assert loaded.search.backend == "hybrid"
-    assert loaded.search.limit == 25
+    async def main():
+        async with Client(mcp) as client:
+            data = await _call_ok(
+                client, "config_set",
+                {"values": {"search.backend": "hybrid", "search.limit": 25}},
+            )
+            assert data["config"]["search"]["backend"] == "hybrid"
+            assert data["config"]["search"]["limit"] == 25
+            assert Path(config_path).exists()
+            loaded = Config.load(config_path)
+            assert loaded.search.backend == "hybrid"
+            assert loaded.search.limit == 25
+
+    _run(main())
 
 
 def test_tool_config_set_bad_backend(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 42, "config_set", {"values": {"search.backend": "bogus"}})
-    assert resp["result"]["isError"] is True
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            res = await client.call_tool(
+                "config_set", {"values": {"search.backend": "bogus"}},
+                raise_on_error=False,
+            )
+            assert res.is_error is True
+
+    _run(main())
 
 
 def test_tool_config_set_unknown_key(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 43, "config_set", {"values": {"nope.key": 1}})
-    assert resp["result"]["isError"] is True
+    async def main():
+        async with Client(_make_server(tmp_path)) as client:
+            res = await client.call_tool(
+                "config_set", {"values": {"nope.key": 1}},
+                raise_on_error=False,
+            )
+            assert res.is_error is True
+
+    _run(main())
 
 
-def test_unknown_method(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = server.handle_message(
-        {"jsonrpc": "2.0", "id": 7, "method": "nope", "params": {}}
+# ---------- stdio e2e (реальный процесс через subprocess) ----------
+
+
+def _write_toml(tmp_path, config):
+    cfg_path = tmp_path / "v8help.toml"
+    cfg_path.write_text(
+        f'corpus_dir = "{config.corpus_dir.as_posix()}"\n'
+        f'db_path = "{config.db_path.as_posix()}"\n'
+        f"books = []\n",
+        encoding="utf-8",
     )
-    assert resp["error"]["code"] == -32601
+    return cfg_path
 
 
-def test_unknown_tool(tmp_path):
-    server = McpServer(_build_tiny_index(tmp_path))
-    resp = _call(server, 8, "nope")
-    assert resp["error"]["code"] == -32602
+def _stdio_start(config_path):
+    p = subprocess.Popen(
+        [sys.executable, "-m", "v8help", "--config", str(config_path), "serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    q = queue.Queue()
+
+    def reader():
+        for raw in p.stdout:
+            line = raw.decode("utf-8").strip()
+            if line:
+                try:
+                    q.put(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    return p, q
 
 
-def test_run_handshake(tmp_path):
+def _stdio_send(p, msg):
+    if isinstance(msg, str):
+        p.stdin.write(msg.encode("utf-8"))
+    else:
+        p.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+    p.stdin.flush()
+
+
+def _stdio_recv(q, expected_id, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            obj = q.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        if obj.get("id") == expected_id:
+            return obj
+    raise AssertionError(f"нет ответа для id={expected_id}")
+
+
+def test_stdio_e2e(tmp_path):
+    """Полный цикл по stdio: initialize, tools/list, tools/call, ошибки протокола."""
     config = _build_tiny_index(tmp_path)
-    stdin = io.StringIO(
-        json.dumps(_init_msg(1)) + "\n"
-        + json.dumps(
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-        )
-        + "\n"
-        + "not json\n"
+    cfg_path = _write_toml(tmp_path, config)
+    p, q = _stdio_start(cfg_path)
+    try:
+        _stdio_send(p, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        })
+        resp = _stdio_recv(q, 1)
+        assert resp["result"]["serverInfo"]["name"] == "v8help"
+        assert resp["result"]["serverInfo"]["version"] == "0.10.0"
+
+        _stdio_send(p, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        _stdio_send(p, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        resp = _stdio_recv(q, 2)
+        names = {t["name"] for t in resp["result"]["tools"]}
+        assert names == TOOL_NAMES
+
+        _stdio_send(p, {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "регулярному"}},
+        })
+        resp = _stdio_recv(q, 3)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data["count"] >= 1
+
+        # неизвестный метод -> JSON-RPC error -32601
+        _stdio_send(p, {"jsonrpc": "2.0", "id": 7, "method": "nope", "params": {}})
+        resp = _stdio_recv(q, 7)
+        assert resp["error"]["code"] == -32601
+
+        # неизвестный инструмент -> isError (не JSON-RPC error)
+        _stdio_send(p, {
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": {"name": "nope", "arguments": {}},
+        })
+        resp = _stdio_recv(q, 8)
+        assert resp["result"]["isError"] is True
+    finally:
+        p.stdin.close()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+# ---------- HTTP (streamable-http) ----------
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_port(port, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError(f"порт {port} не поднялся")
+
+
+def test_http_transport(tmp_path):
+    """streamable-http: tools/list, tools/call, ошибка isError."""
+    mcp = _make_server(tmp_path)
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(mcp.http_app(), host="127.0.0.1", port=port, log_level="warning")
     )
-    out = io.StringIO()
-    rc = run(config, stdin=stdin, stdout=out)
-    assert rc == 0
-    lines = [json.loads(l) for l in out.getvalue().splitlines()]
-    assert [l["id"] for l in lines] == [1, 2, None]
-    assert lines[-1]["error"]["code"] == -32700
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        _wait_port(port)
+
+        async def main():
+            async with Client(f"http://127.0.0.1:{port}/mcp") as client:
+                names = {t.name for t in await client.list_tools()}
+                assert names == TOOL_NAMES
+                data = await _call_ok(client, "search", {"query": "регулярному"})
+                assert data["count"] >= 1
+                res = await client.call_tool(
+                    "get_page", {"id": "нет_такой"}, raise_on_error=False
+                )
+                assert res.is_error is True
+
+        _run(main())
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)

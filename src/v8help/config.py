@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,10 +76,13 @@ class Config:
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
         if path is None:
-            return cls()
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-        return cls.from_dict(data)
+            cfg = cls()
+        else:
+            with open(path, "rb") as fh:
+                data = tomllib.load(fh)
+            cfg = cls.from_dict(data)
+        _apply_env_overrides(cfg)
+        return cfg
 
     @classmethod
     def from_dict(cls, data: dict) -> Config:
@@ -242,6 +246,75 @@ def _book_lang(book: str, default: str) -> str:
     return default
 
 
+# ---------- Приоритет env V8HELP_* над файлом конфига (12-factor) ------------
+
+_ENV_BOOL_TRUE = {"1", "true", "yes", "on"}
+
+# env → (плоский ключ в Config, тип значения).
+_ENV_SCALARS = {
+    "V8HELP_DB_PATH": ("db_path", "path"),
+    "V8HELP_CORPUS_DIR": ("corpus_dir", "path"),
+    "V8HELP_BIN_DIR": ("bin_dir", "path"),
+    "V8HELP_LANG": ("lang", "str"),
+    "V8HELP_BOOKS": ("books", "books"),
+    "V8HELP_INCLUDE_ENGLISH": ("include_english", "bool"),
+    "V8HELP_BACKEND": ("search.backend", "str"),
+    "V8HELP_LIMIT": ("search.limit", "int"),
+    "V8HELP_MAX_CHUNKS_PER_PAGE": ("search.max_chunks_per_page", "int"),
+    "V8HELP_BUILD_CLEANUP": ("build.cleanup", "bool"),
+    "V8HELP_BUILD_CHUNK_SIZE": ("build.chunk_size", "int"),
+    "V8HELP_BUILD_CHUNK_OVERLAP": ("build.chunk_overlap", "int"),
+}
+
+_EMBEDDER_ENV_FIELDS = (
+    "model", "base_url", "api_key", "provider",
+    "dims", "batch_size", "embed_chars", "threads",
+)
+
+
+def _cvt_env(kind: str, value: str):
+    if kind == "path":
+        return Path(value)
+    if kind == "bool":
+        return str(value).strip().lower() in _ENV_BOOL_TRUE
+    if kind == "int":
+        return int(value)
+    if kind == "books":
+        return [b.strip() for b in value.split(",") if b.strip()]
+    return str(value)
+
+
+def _apply_env_overrides(cfg: Config) -> None:
+    """Env V8HELP_* перекрывают значения из TOML (для контейнера/Docker)."""
+    for env, (key, kind) in _ENV_SCALARS.items():
+        raw = os.environ.get(env)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = _cvt_env(kind, raw)
+        except ValueError:
+            continue
+        obj = cfg
+        parts = key.split(".")
+        for p in parts[:-1]:
+            obj = getattr(obj, p)
+        setattr(obj, parts[-1], value)
+
+    for prefix, target in (
+        ("V8HELP_EMBEDDER_INDEX_", cfg.embedder_index),
+        ("V8HELP_EMBEDDER_QUERY_", cfg.embedder_query),
+    ):
+        for field in _EMBEDDER_ENV_FIELDS:
+            raw = os.environ.get(prefix + field.upper())
+            if raw is None or raw == "":
+                continue
+            try:
+                value = int(raw) if field in ("dims", "batch_size", "embed_chars", "threads") else str(raw)
+            except ValueError:
+                continue
+            setattr(target, field, value)
+
+
 # ---------- Автодискавери каталога bin платформы 1С ------------------------
 
 _VERSION_RE = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?")
@@ -364,17 +437,77 @@ def _bin_dir_for(loc: Path) -> Path | None:
     """InstallLocation может указывать на корень версии (…\\8.5.1.1423\\) или сразу на bin."""
     for cand in (loc / "bin", loc):
         try:
-            if cand.is_dir() and any(cand.glob("*.hbk")):
+            if cand.is_dir() and (any(cand.glob("*.hbk")) or _has_1cv8_binary(cand)):
                 return cand
         except OSError:
             continue
     return None
 
 
+def _has_1cv8_binary(d: Path) -> bool:
+    """В каталоге есть исполняемый файл платформы (1cv8 / 1cv8.exe / 1cv8c…)."""
+    try:
+        for name in ("1cv8", "1cv8.exe", "1cv8c", "1cv8c.exe"):
+            if (d / name).exists():
+                return True
+    except OSError:
+        pass
+    return False
+
+
+_LINUX_1CV8_ROOTS = ("/opt", "/usr/lib", "/usr/local")
+_LINUX_MAX_DEPTH = 6
+
+
+def _version_from_path(path: Path) -> tuple[int, ...] | None:
+    """Первая компонента пути (снизу вверх), похожая на версию платформы."""
+    for p in (path, *path.parents):
+        v = _parse_version(p.name)
+        if v and len(v) >= 2:
+            return v
+    return None
+
+
+def _linux_platform_dirs() -> list[tuple[tuple[int, ...], Path]]:
+    """Установки 1С под Linux: <root>/1cv8/**/<version>[/bin] + which 1cv8.
+
+    Раскладки: классическая /opt/1cv8/x86_64/<version>/bin и 8.5.x, где
+    бинарники и .hbk лежат прямо в каталоге версии (без bin).
+    """
+    out: list[tuple[tuple[int, ...], Path]] = []
+    seen: set[Path] = set()
+    for root in _LINUX_1CV8_ROOTS:
+        base = Path(root) / "1cv8"
+        if not base.is_dir():
+            continue
+        for dirpath, dirnames, _files in os.walk(base):
+            cur = Path(dirpath)
+            if len(cur.relative_to(base).parts) >= _LINUX_MAX_DEPTH:
+                dirnames[:] = []
+                continue
+            v = _version_from_path(cur)
+            if not v or cur in seen:
+                continue
+            if _bin_dir_for(cur) is not None:
+                seen.add(cur)
+                out.append((v, cur))
+    exe = shutil.which("1cv8")
+    if exe:
+        bd = Path(os.path.realpath(exe)).parent
+        cand = bd.parent if bd.name == "bin" else bd
+        v = _version_from_path(bd)
+        if v and cand not in seen and (_has_1cv8_binary(bd) or any(bd.glob("*.hbk"))):
+            seen.add(cand)
+            out.append((v, cand))
+    return out
+
+
 def _collect_platforms() -> list[tuple[tuple[int, ...], Path]]:
     """Все bin-каталоги платформы с .hbk, по убыванию версии."""
     candidates = _registry_1c_installs()
     fs = _fs_platform_bin_dirs()
+    if os.name == "posix":
+        fs += _linux_platform_dirs()
     seen = {p for _, p in candidates}
     for v, p in fs:
         if p not in seen:
