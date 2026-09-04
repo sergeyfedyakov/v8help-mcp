@@ -12,11 +12,8 @@
     },
     "lancedb": {},
     "fileExtensions": [
-      ".py",
       ".md",
-      ".json",
-      ".jsonc",
-      ".toml"
+      ".py"
     ],
     "searchMinScore": 0.4,
     "searchMaxResults": 20,
