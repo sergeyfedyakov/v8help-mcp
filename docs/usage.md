@@ -156,7 +156,9 @@ v8help serve [--http] [--host HOST] [--port PORT]
 
 `discover()` — показать конфиг и автодискавери: каталог `bin` установленной
 платформы 1С (реестр Uninstall/ФС на Windows; `/opt/1cv8`, `/usr/lib`,
-`/usr/local` и `PATH` на Linux), доступные эмбеддеры на localhost-портах
+`/usr/local` и `PATH` на Linux; на macOS — `/opt/1cv8/<версия>` с бинарями
+без `bin/` плюс ручной фолбэк `/usr/local/opt/1cv8`), доступные эмбеддеры
+на localhost-портах
 (LM Studio/Ollama) и состояние индекса. В контейнере Docker
 `platforms`/`embedders` обычно пустые — адрес эмбеддера задаётся через
 `embedder.*.base_url` в env/toml и виден в `config` вывода.

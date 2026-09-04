@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from v8help import config as config_mod
 from v8help.config import (
     Config,
@@ -7,6 +9,7 @@ from v8help.config import (
     _fs_platform_bin_dirs,
     _is_1c_platform,
     _linux_platform_dirs,
+    _macos_platform_dirs,
     _parse_dotted_version,
     _parse_version,
     discover_bin_dir,
@@ -158,3 +161,71 @@ def test_linux_platform_dirs_no_bin(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "shutil", type("S", (), {"which": lambda n: None}))
     dirs = _linux_platform_dirs()
     assert dirs == [((8, 5, 1, 1522), ver)]
+
+
+def _silence_other_sources(monkeypatch, tmp_path):
+    """Гасим реестр/Program Files/Linux-скан/which — чтобы тесты шли только по фейку."""
+    monkeypatch.setattr(config_mod, "_registry_1c_installs", lambda: [])
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "nofs"))
+    monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+    monkeypatch.setattr(config_mod, "_LINUX_1CV8_ROOTS", (str(tmp_path / "nolinux"),))
+    monkeypatch.setattr(
+        config_mod, "shutil", type("S", (), {"which": lambda n: None})
+    )
+
+
+def test_macos_platform_dirs_both_layouts(tmp_path, monkeypatch):
+    """pkg (8.3.x): бинарь прямо в каталоге версии; допустим и вариант с bin/."""
+    ver = tmp_path / "opt" / "1cv8" / "8.3.27.2214"
+    ver.mkdir(parents=True)
+    (ver / "1cv8c").write_bytes(b"x")
+    alt = tmp_path / "local" / "opt" / "1cv8" / "8.5.1.1522" / "bin"
+    alt.mkdir(parents=True)
+    (alt / "shcntx_ru.hbk").write_bytes(b"x")
+    monkeypatch.setattr(
+        config_mod,
+        "_MACOS_1CV8_BASES",
+        (str(ver.parent), str(alt.parent.parent)),
+    )
+    dirs = dict(_macos_platform_dirs())
+    assert dirs[(8, 3, 27, 2214)] == ver
+    # обход может выдать и каталог версии, и его bin (_walk_1cv8), разрешение одно
+    assert _bin_dir_for(dirs[(8, 5, 1, 1522)]) == alt
+
+
+def test_discover_macos_darwin_branch_forced(tmp_path, monkeypatch):
+    """Darwin-ветка прогоняется на любом раннере: _is_darwin подменён."""
+    ver = tmp_path / "fakeopt" / "1cv8" / "8.5.1.1522"
+    ver.mkdir(parents=True)
+    (ver / "1cv8").write_bytes(b"x")
+    _silence_other_sources(monkeypatch, tmp_path)
+    monkeypatch.setattr(config_mod, "_MACOS_1CV8_BASES", (str(ver.parent),))
+    monkeypatch.setattr(config_mod, "_is_darwin", lambda: True)
+    reset_discovery_cache()
+    assert discover_bin_dir() == ver
+    assert discover_platforms()[0]["version"] == "8.5.1.1522"
+
+
+def test_discover_macos_ignores_applications_bundles(tmp_path, monkeypatch):
+    """Обёртки .app в /Applications без .hbk/бинарей платформы не дают находок."""
+    app = tmp_path / "Applications" / "1CEnterprise - Thin client.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True)
+    monkeypatch.setattr(
+        config_mod, "_MACOS_1CV8_BASES", (str(tmp_path / "opt" / "1cv8"),)
+    )
+    assert _macos_platform_dirs() == []
+
+
+def test_discover_empty_without_platform(tmp_path, monkeypatch):
+    """Раннер без 1С: discover молча пуст, resolve_sources даёт понятную ошибку."""
+    _silence_other_sources(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        config_mod, "_MACOS_1CV8_BASES", (str(tmp_path / "nomac"),)
+    )
+    monkeypatch.setattr(config_mod, "_is_darwin", lambda: True)
+    reset_discovery_cache()
+    assert discover_bin_dir() is None
+    assert discover_platforms() == []
+    with pytest.raises(RuntimeError) as ei:
+        Config().resolve_sources()
+    assert "bin_dir" in str(ei.value)

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,38 +100,13 @@ class Config:
             cfg.lang = str(data["lang"])
         if "include_english" in data:
             cfg.include_english = bool(data["include_english"])
-
-        cfg.sources = [
-            SourceSpec(
-                id=str(s.get("id", "")),
-                hbk=Path(s.get("hbk", "")),
-                prefix=str(s.get("prefix", "")),
-                scheme=str(s.get("scheme", "")),
-                lang=str(s.get("lang", cfg.lang)),
-            )
-            for s in data.get("sources", [])
-        ]
-
+        cfg.sources = _sources_from(data, cfg.lang)
         embedder = data.get("embedder") or {}
         cfg.embedder_index = _embedder(embedder.get("index") or {})
         cfg.embedder_query = _embedder(embedder.get("query") or {})
-
         if "search" in data:
-            s = data["search"]
-            cfg.search = SearchConfig(
-                backend=s.get("backend", cfg.search.backend),
-                limit=int(s.get("limit", cfg.search.limit)),
-                max_chunks_per_page=int(
-                    s.get("max_chunks_per_page", cfg.search.max_chunks_per_page)
-                ),
-            )
-
-        build = data.get("build") or {}
-        cfg.build = BuildConfig(
-            cleanup=bool(build.get("cleanup", cfg.build.cleanup)),
-            chunk_size=int(build.get("chunk_size", cfg.build.chunk_size)),
-            chunk_overlap=int(build.get("chunk_overlap", cfg.build.chunk_overlap)),
-        )
+            cfg.search = _search_from(data["search"], cfg.search)
+        cfg.build = _build_from(data, cfg.build)
         return cfg
 
     def resolve_bin_dir(self) -> Path:
@@ -148,38 +124,11 @@ class Config:
             return []
         bin_dir = self.resolve_bin_dir()
         if str(bin_dir) in ("", "."):
-            raise RuntimeError(
-                "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
-                "конфиге или проверьте установку платформы 1С (реестр Uninstall)."
-            )
-        out: list[SourceSpec] = []
-        for book in self.books:
-            prefix, scheme = _book_meta(book)
-            out.append(
-                SourceSpec(
-                    id=book,
-                    hbk=bin_dir / f"{book}.hbk",
-                    prefix=prefix,
-                    scheme=scheme,
-                    lang=_book_lang(book, lang),
-                )
-            )
-        return out
+            raise RuntimeError(SOURCES_NO_BINDIR)
+        return [_book_source(b, bin_dir, lang) for b in self.books]
 
     def to_dict(self) -> dict:
         """Сериализация для config_get / персиста в TOML."""
-        def _emb(e: EmbedderConfig) -> dict:
-            return {
-                "model": e.model,
-                "base_url": e.base_url,
-                "api_key": e.api_key,
-                "dims": e.dims,
-                "batch_size": e.batch_size,
-                "embed_chars": e.embed_chars,
-                "threads": e.threads,
-                "provider": e.provider,
-            }
-
         d: dict = {
             "bin_dir": str(self.bin_dir) if str(self.bin_dir) not in ("", ".") else "",
             "corpus_dir": str(self.corpus_dir),
@@ -187,32 +136,15 @@ class Config:
             "lang": self.lang,
             "books": list(self.books),
             "include_english": self.include_english,
-            "search": {
-                "backend": self.search.backend,
-                "limit": self.search.limit,
-                "max_chunks_per_page": self.search.max_chunks_per_page,
-            },
-            "build": {
-                "cleanup": self.build.cleanup,
-                "chunk_size": self.build.chunk_size,
-                "chunk_overlap": self.build.chunk_overlap,
-            },
+            "search": _search_dict(self.search),
+            "build": _build_dict(self.build),
             "embedder": {
-                "index": _emb(self.embedder_index),
-                "query": _emb(self.embedder_query),
+                "index": _emb_dict(self.embedder_index),
+                "query": _emb_dict(self.embedder_query),
             },
         }
         if self.sources:
-            d["sources"] = [
-                {
-                    "id": s.id,
-                    "hbk": str(s.hbk),
-                    "prefix": s.prefix,
-                    "scheme": s.scheme,
-                    "lang": s.lang,
-                }
-                for s in self.sources
-            ]
+            d["sources"] = [_source_dict(s) for s in self.sources]
         return d
 
 
@@ -227,6 +159,84 @@ def _embedder(data: dict) -> EmbedderConfig:
         threads=int(data.get("threads", 2)),
         provider=str(data.get("provider", "")),
     )
+
+
+def _emb_dict(e: EmbedderConfig) -> dict:
+    return {
+        "model": e.model, "base_url": e.base_url, "api_key": e.api_key,
+        "dims": e.dims, "batch_size": e.batch_size,
+        "embed_chars": e.embed_chars, "threads": e.threads, "provider": e.provider,
+    }
+
+
+def _source_dict(s: SourceSpec) -> dict:
+    return {
+        "id": s.id, "hbk": str(s.hbk), "prefix": s.prefix,
+        "scheme": s.scheme, "lang": s.lang,
+    }
+
+
+SOURCES_NO_BINDIR = (
+    "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
+    "конфиге или проверьте установку платформы 1С (реестр Uninstall)."
+)
+
+
+def _book_source(book: str, bin_dir: Path, lang: str) -> SourceSpec:
+    prefix, scheme = _book_meta(book)
+    return SourceSpec(
+        id=book,
+        hbk=bin_dir / f"{book}.hbk",
+        prefix=prefix,
+        scheme=scheme,
+        lang=_book_lang(book, lang),
+    )
+
+
+def _sources_from(data: dict, default_lang: str) -> list[SourceSpec]:
+    return [
+        SourceSpec(
+            id=str(s.get("id", "")),
+            hbk=Path(s.get("hbk", "")),
+            prefix=str(s.get("prefix", "")),
+            scheme=str(s.get("scheme", "")),
+            lang=str(s.get("lang", default_lang)),
+        )
+        for s in data.get("sources", [])
+    ]
+
+
+def _search_from(s: dict, default: SearchConfig) -> SearchConfig:
+    return SearchConfig(
+        backend=s.get("backend", default.backend),
+        limit=int(s.get("limit", default.limit)),
+        max_chunks_per_page=int(
+            s.get("max_chunks_per_page", default.max_chunks_per_page)
+        ),
+    )
+
+
+def _search_dict(s: SearchConfig) -> dict:
+    return {
+        "backend": s.backend, "limit": s.limit,
+        "max_chunks_per_page": s.max_chunks_per_page,
+    }
+
+
+def _build_from(data: dict, default: BuildConfig) -> BuildConfig:
+    build = data.get("build") or {}
+    return BuildConfig(
+        cleanup=bool(build.get("cleanup", default.cleanup)),
+        chunk_size=int(build.get("chunk_size", default.chunk_size)),
+        chunk_overlap=int(build.get("chunk_overlap", default.chunk_overlap)),
+    )
+
+
+def _build_dict(b: BuildConfig) -> dict:
+    return {
+        "cleanup": b.cleanup, "chunk_size": b.chunk_size,
+        "chunk_overlap": b.chunk_overlap,
+    }
 
 
 def _book_meta(book: str) -> tuple[str, str]:
@@ -284,6 +294,29 @@ def _cvt_env(kind: str, value: str):
     return str(value)
 
 
+def _set_dotted(cfg: Config, key: str, value) -> None:
+    """Присваивание по плоскому ключу 'a.b' (b — атрибут cfg.a) или 'a'."""
+    obj = cfg
+    parts = key.split(".")
+    for p in parts[:-1]:
+        obj = getattr(obj, p)
+    setattr(obj, parts[-1], value)
+
+
+def _apply_embedder_env(target, prefix: str) -> None:
+    """V8HELP_EMBEDDER_{INDEX,QUERY}_<FIELD> поверх одного EmbedderConfig."""
+    ints = ("dims", "batch_size", "embed_chars", "threads")
+    for field in _EMBEDDER_ENV_FIELDS:
+        raw = os.environ.get(prefix + field.upper())
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw) if field in ints else str(raw)
+        except ValueError:
+            continue
+        setattr(target, field, value)
+
+
 def _apply_env_overrides(cfg: Config) -> None:
     """Env V8HELP_* перекрывают значения из TOML (для контейнера/Docker)."""
     for env, (key, kind) in _ENV_SCALARS.items():
@@ -294,25 +327,9 @@ def _apply_env_overrides(cfg: Config) -> None:
             value = _cvt_env(kind, raw)
         except ValueError:
             continue
-        obj = cfg
-        parts = key.split(".")
-        for p in parts[:-1]:
-            obj = getattr(obj, p)
-        setattr(obj, parts[-1], value)
-
-    for prefix, target in (
-        ("V8HELP_EMBEDDER_INDEX_", cfg.embedder_index),
-        ("V8HELP_EMBEDDER_QUERY_", cfg.embedder_query),
-    ):
-        for field in _EMBEDDER_ENV_FIELDS:
-            raw = os.environ.get(prefix + field.upper())
-            if raw is None or raw == "":
-                continue
-            try:
-                value = int(raw) if field in ("dims", "batch_size", "embed_chars", "threads") else str(raw)
-            except ValueError:
-                continue
-            setattr(target, field, value)
+        _set_dotted(cfg, key, value)
+    _apply_embedder_env(cfg.embedder_index, "V8HELP_EMBEDDER_INDEX_")
+    _apply_embedder_env(cfg.embedder_query, "V8HELP_EMBEDDER_QUERY_")
 
 
 # ---------- Автодискавери каталога bin платформы 1С ------------------------
@@ -369,46 +386,56 @@ def _reg_str(key, name: str) -> str:
         return ""
 
 
+_UNINSTALL_TAIL = r"Microsoft\Windows\CurrentVersion\Uninstall"
+_UNINSTALL_SUB = "SOFTWARE\\" + _UNINSTALL_TAIL
+_UNINSTALL_WOW_SUB = "SOFTWARE\\WOW6432Node\\" + _UNINSTALL_TAIL
+
+
+def _uninstall_entries(winreg, hive, subkey: str) -> list[tuple[str, str, str]]:
+    """(DisplayName, DisplayVersion, InstallLocation) продуктов из ключа Uninstall."""
+    try:
+        key = winreg.OpenKey(hive, subkey)
+    except OSError:
+        return []
+    out: list[tuple[str, str, str]] = []
+    with key:
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(key, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                with winreg.OpenKey(key, name) as sk:
+                    out.append((
+                        _reg_str(sk, "DisplayName"),
+                        _reg_str(sk, "DisplayVersion"),
+                        _reg_str(sk, "InstallLocation"),
+                    ))
+            except OSError:
+                continue
+    return out
+
+
 def _registry_1c_installs() -> list[tuple[tuple[int, ...], Path]]:
     """Установки «1С:Предприятие» из реестра Uninstall (HKLM/WOW6432Node/HKCU)."""
     try:
         import winreg
     except ImportError:
         return []
-    roots = [
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-        (
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        ),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-    ]
+    roots = (
+        (winreg.HKEY_LOCAL_MACHINE, _UNINSTALL_SUB),
+        (winreg.HKEY_LOCAL_MACHINE, _UNINSTALL_WOW_SUB),
+        (winreg.HKEY_CURRENT_USER, _UNINSTALL_SUB),
+    )
     out: list[tuple[tuple[int, ...], Path]] = []
     for hive, sub in roots:
-        try:
-            key = winreg.OpenKey(hive, sub)
-        except OSError:
-            continue
-        with key:
-            i = 0
-            while True:
-                try:
-                    name = winreg.EnumKey(key, i)
-                except OSError:
-                    break
-                i += 1
-                try:
-                    with winreg.OpenKey(key, name) as sk:
-                        dn = _reg_str(sk, "DisplayName")
-                        ver = _reg_str(sk, "DisplayVersion")
-                        loc = _reg_str(sk, "InstallLocation")
-                except OSError:
-                    continue
-                if not _is_1c_platform(dn):
-                    continue
-                v = _parse_version(ver) or _parse_dotted_version(dn)
-                if v is None or not loc:
-                    continue
+        for dn, ver, loc in _uninstall_entries(winreg, hive, sub):
+            if not _is_1c_platform(dn) or not loc:
+                continue
+            v = _parse_version(ver) or _parse_dotted_version(dn)
+            if v is not None:
                 out.append((v, Path(loc)))
     return out
 
@@ -468,6 +495,36 @@ def _version_from_path(path: Path) -> tuple[int, ...] | None:
     return None
 
 
+def _walk_1cv8(base: Path, seen: set[Path]) -> list[tuple[tuple[int, ...], Path]]:
+    """Каталоги вида <root>/1cv8/**/<version>[/bin] с .hbk/бинарями платформы."""
+    out: list[tuple[tuple[int, ...], Path]] = []
+    for dirpath, dirnames, _files in os.walk(base):
+        cur = Path(dirpath)
+        if len(cur.relative_to(base).parts) >= _LINUX_MAX_DEPTH:
+            dirnames[:] = []
+            continue
+        v = _version_from_path(cur)
+        if not v or cur in seen:
+            continue
+        if _bin_dir_for(cur) is not None:
+            seen.add(cur)
+            out.append((v, cur))
+    return out
+
+
+def _which_1cv8(seen: set[Path]) -> tuple[tuple[int, ...], Path] | None:
+    """Каталог версии возле исполняемого файла, найденного ``which 1cv8``."""
+    exe = shutil.which("1cv8")
+    if not exe:
+        return None
+    bd = Path(os.path.realpath(exe)).parent
+    cand = bd.parent if bd.name == "bin" else bd
+    v = _version_from_path(bd)
+    if v and cand not in seen and (_has_1cv8_binary(bd) or any(bd.glob("*.hbk"))):
+        return (v, cand)
+    return None
+
+
 def _linux_platform_dirs() -> list[tuple[tuple[int, ...], Path]]:
     """Установки 1С под Linux: <root>/1cv8/**/<version>[/bin] + which 1cv8.
 
@@ -478,27 +535,35 @@ def _linux_platform_dirs() -> list[tuple[tuple[int, ...], Path]]:
     seen: set[Path] = set()
     for root in _LINUX_1CV8_ROOTS:
         base = Path(root) / "1cv8"
-        if not base.is_dir():
-            continue
-        for dirpath, dirnames, _files in os.walk(base):
-            cur = Path(dirpath)
-            if len(cur.relative_to(base).parts) >= _LINUX_MAX_DEPTH:
-                dirnames[:] = []
-                continue
-            v = _version_from_path(cur)
-            if not v or cur in seen:
-                continue
-            if _bin_dir_for(cur) is not None:
-                seen.add(cur)
-                out.append((v, cur))
-    exe = shutil.which("1cv8")
-    if exe:
-        bd = Path(os.path.realpath(exe)).parent
-        cand = bd.parent if bd.name == "bin" else bd
-        v = _version_from_path(bd)
-        if v and cand not in seen and (_has_1cv8_binary(bd) or any(bd.glob("*.hbk"))):
-            seen.add(cand)
-            out.append((v, cand))
+        if base.is_dir():
+            out += _walk_1cv8(base, seen)
+    entry = _which_1cv8(seen)
+    if entry:
+        out.append(entry)
+    return out
+
+
+def _is_darwin() -> bool:
+    """Признак macOS; монкипатчится в тестах, чтобы гонять darwin-ветку на любом раннере."""
+    return sys.platform == "darwin"
+
+
+# Основной /opt/1cv8/<version> покрывает общий posix-скан (_LINUX_1CV8_ROOTS
+# включает /opt); здесь только доп.(macOS-специфичные базы ручной установки).
+_MACOS_1CV8_BASES = ("/usr/local/opt/1cv8",)
+
+
+def _macos_platform_dirs() -> list[tuple[tuple[int, ...], Path]]:
+    """macOS (8.3.x pkg и 8.5.x dmg): версии в /opt/1cv8/<version> с бинарями
+    прямо в каталоге версии; фолбэк ручной установки — /usr/local/opt/1cv8.
+    Обёртки 1Cv8*.app в /Applications .hbk не содержат и не сканируются.
+    """
+    out: list[tuple[tuple[int, ...], Path]] = []
+    seen: set[Path] = set()
+    for base_s in _MACOS_1CV8_BASES:
+        base = Path(base_s)
+        if base.is_dir():
+            out += _walk_1cv8(base, seen)
     return out
 
 
@@ -508,6 +573,8 @@ def _collect_platforms() -> list[tuple[tuple[int, ...], Path]]:
     fs = _fs_platform_bin_dirs()
     if os.name == "posix":
         fs += _linux_platform_dirs()
+    if _is_darwin():
+        fs += _macos_platform_dirs()
     seen = {p for _, p in candidates}
     for v, p in fs:
         if p not in seen:
@@ -559,6 +626,23 @@ _EMBEDDER_PORTS = (1234, 11434, 8000, 8080, 4891, 5000, 3000)
 _embedders_cache: tuple[bool, list[dict]] = (False, [])
 
 
+def _probe_models(base: str, timeout: float) -> list[str]:
+    """Идентификаторы моделей из OpenAI-совместимого ``{base}/models`` ([] если недоступен)."""
+    import urllib.request as _ur
+    try:
+        req = _ur.Request(f"{base}/models", method="GET")
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    items = data.get("data") if isinstance(data, dict) else None
+    return [
+        m.get("id", "")
+        for m in (items or [])
+        if isinstance(m, dict) and m.get("id")
+    ]
+
+
 def discover_embedders(timeout: float = 0.8) -> list[dict]:
     """Пробует OpenAI-совместимые ``/v1/models`` на localhost (LM Studio, Ollama, …).
 
@@ -568,33 +652,18 @@ def discover_embedders(timeout: float = 0.8) -> list[dict]:
     done, val = _embedders_cache
     if done:
         return val
-
-    import urllib.request as _ur
-
     out: list[dict] = []
     for port in _EMBEDDER_PORTS:
         base = f"http://localhost:{port}/v1"
-        try:
-            req = _ur.Request(f"{base}/models", method="GET")
-            with _ur.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            continue
-        items = data.get("data") if isinstance(data, dict) else None
-        models = [
-            m.get("id", "")
-            for m in (items or [])
-            if isinstance(m, dict) and m.get("id")
-        ]
-        if not models:
-            continue
-        out.append(
-            {
-                "base_url": base,
-                "models": models,
-                "embedding_models": [m for m in models if "embed" in m.lower()],
-            }
-        )
+        models = _probe_models(base, timeout)
+        if models:
+            out.append(
+                {
+                    "base_url": base,
+                    "models": models,
+                    "embedding_models": [m for m in models if "embed" in m.lower()],
+                }
+            )
     _embedders_cache = (True, out)
     return out
 
@@ -611,35 +680,45 @@ def _toml_scalar(v) -> str:
     raise TypeError(f"Неподдерживаемый тип для TOML: {type(v)}")
 
 
+def _toml_value(k: str, v) -> str:
+    if isinstance(v, list):
+        return f"{k} = [{', '.join(_toml_scalar(x) for x in v)}]"
+    return f"{k} = {_toml_scalar(v)}"
+
+
+def _emit_table(tables: list[str], name: str, table: dict) -> None:
+    """Один [name]-блок: скаляры, массивы и один уровень вложенных подтаблиц."""
+    tables.append(f"[{name}]")
+    for k, v in table.items():
+        if isinstance(v, dict):
+            tables.append(f"[{name}.{k}]")
+            for kk, vv in v.items():
+                tables.append(f"{kk} = {_toml_scalar(vv)}")
+        else:
+            tables.append(_toml_value(k, v))
+
+
 def config_to_toml(data: dict) -> str:
     """Сериализует структуру ``Config.to_dict()`` в валидный TOML."""
     scalars: list[str] = []
     tables: list[str] = []
-
-    def _emit_table(name: str, table: dict) -> None:
-        tables.append(f"[{name}]")
-        for k, v in table.items():
-            if isinstance(v, dict):
-                tables.append(f"[{name}.{k}]")
-                for kk, vv in v.items():
-                    tables.append(f"{kk} = {_toml_scalar(vv)}")
-            elif isinstance(v, list):
-                tables.append(f"{k} = [{', '.join(_toml_scalar(x) for x in v)}]")
-            else:
-                tables.append(f"{k} = {_toml_scalar(v)}")
-
     for k, v in data.items():
         if isinstance(v, dict):
-            _emit_table(k, v)
+            _emit_table(tables, k, v)
         elif isinstance(v, list) and v and isinstance(v[0], dict):
-            for item in v:
-                tables.append(f"[[{k}]]")
-                for kk, vv in item.items():
-                    tables.append(f"{kk} = {_toml_scalar(vv)}")
+            tables += _emit_array_of_tables(k, v)
         elif isinstance(v, list):
-            scalars.append(f"{k} = [{', '.join(_toml_scalar(x) for x in v)}]")
+            scalars.append(_toml_value(k, v))
         else:
-            scalars.append(f"{k} = {_toml_scalar(v)}")
-
+            scalars.append(_toml_value(k, v))
     body = "\n".join(scalars + tables)
     return (body + "\n") if body else ""
+
+
+def _emit_array_of_tables(name: str, items: list[dict]) -> list[str]:
+    """Блоки [[name]] для списков словарей (sources)."""
+    out: list[str] = []
+    for item in items:
+        out.append(f"[[{name}]]")
+        out += [f"{kk} = {_toml_scalar(vv)}" for kk, vv in item.items()]
+    return out

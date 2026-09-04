@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "v8help"
-version = "0.11.0"
+version = "0.12.0"
 description = "MCP-инструмент для чтения, индексации и поиска по файлам справки 1С (.hbk)"
 readme = "README.md"
 license = "MIT"
@@ -15,6 +15,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Topic :: Software Development :: Documentation",
 ]
 dependencies = [
