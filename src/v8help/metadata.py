@@ -77,15 +77,7 @@ def _is_section_line(s: str) -> bool:
     return bool(_SECTION_RE.match(s) or _BOLD_SECTION_RE.match(s))
 
 
-def extract_description(text: str) -> str:
-    """Возвращает текст секций описания статьи (пустая строка, если секций нет).
-
-    Собираются ВСЕ секции вида ``Описание:``, ``Описание варианта:``,
-    ``Описание варианта метода:`` (статьи с несколькими вариантами синтаксиса) —
-    каждая до ближайшей строки-секции (``…:``, ``Вариант синтаксиса: …``,
-    ``**…:**``, ``---``). Markdown-ссылки сворачиваются в текст.
-    """
-    lines = text.split("\n")
+def _find_desc_heads(lines: list[str]) -> tuple[list[int], list[str]]:
     heads: list[int] = []
     tails: list[str] = []
     for i, line in enumerate(lines):
@@ -93,9 +85,12 @@ def extract_description(text: str) -> str:
         if m:
             heads.append(i)
             tails.append(m.group(1).strip())
-    if not heads:
-        return ""
+    return heads, tails
 
+
+def _collect_desc_parts(
+    lines: list[str], heads: list[int], tails: list[str]
+) -> list[str]:
     parts: list[str] = []
     for k, desc_i in enumerate(heads):
         j = desc_i + 1
@@ -110,13 +105,32 @@ def extract_description(text: str) -> str:
             if s:
                 parts.append(s)
             j += 1
-    if not parts:
-        return ""
+    return parts
 
+
+def _flatten_desc(parts: list[str]) -> str:
     txt = " ".join(parts)
     txt = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", txt)
     txt = txt.replace("**", "")
     return re.sub(r"\s+", " ", txt).strip()
+
+
+def extract_description(text: str) -> str:
+    """Возвращает текст секций описания статьи (пустая строка, если секций нет).
+
+    Собираются ВСЕ секции вида ``Описание:``, ``Описание варианта:``,
+    ``Описание варианта метода:`` (статьи с несколькими вариантами синтаксиса) —
+    каждая до ближайшей строки-секции (``…:``, ``Вариант синтаксиса: …``,
+    ``**…:**``, ``---``). Markdown-ссылки сворачиваются в текст.
+    """
+    lines = text.split("\n")
+    heads, tails = _find_desc_heads(lines)
+    if not heads:
+        return ""
+    parts = _collect_desc_parts(lines, heads, tails)
+    if not parts:
+        return ""
+    return _flatten_desc(parts)
 
 
 def _strip_ext(name: str) -> str:

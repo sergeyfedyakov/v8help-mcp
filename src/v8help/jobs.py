@@ -12,6 +12,22 @@ from v8help.config import Config
 from v8help.indexer import BuildResult, run_build
 
 
+_RESULT_FIELDS = (
+    "pages", "links", "sources", "duration_sec", "db_path", "bin_dir",
+    "chunks", "vectors", "embed_model", "embed_dims", "embed_chars",
+    "chunk_size", "chunk_overlap", "threads",
+)
+
+
+def _result_fields(r: BuildResult | None) -> dict:
+    """Поля результата сборки: None до завершения; skipped=False, пока нет результата."""
+    if r is None:
+        d = {k: None for k in _RESULT_FIELDS}
+        d["skipped"] = False
+        return d
+    return {"skipped": r.skipped, **{k: getattr(r, k) for k in _RESULT_FIELDS}}
+
+
 @dataclass
 class Job:
     id: str
@@ -24,29 +40,15 @@ class Job:
     finished_at: float | None = None
 
     def as_dict(self) -> dict:
-        r = self.result
-        return {
+        d = {
             "id": self.id,
             "status": self.status,
             "stage": self.stage,
             "message": self.message,
-            "skipped": r.skipped if r else False,
-            "pages": r.pages if r else None,
-            "links": r.links if r else None,
-            "sources": r.sources if r else None,
-            "duration_sec": r.duration_sec if r else None,
-            "db_path": r.db_path if r else None,
-            "bin_dir": r.bin_dir if r else None,
-            "chunks": r.chunks if r else None,
-            "vectors": r.vectors if r else None,
-            "embed_model": r.embed_model if r else None,
-            "embed_dims": r.embed_dims if r else None,
-            "embed_chars": r.embed_chars if r else None,
-            "chunk_size": r.chunk_size if r else None,
-            "chunk_overlap": r.chunk_overlap if r else None,
-            "threads": r.threads if r else None,
-            "error": self.error or None,
         }
+        d.update(_result_fields(self.result))
+        d["error"] = self.error or None
+        return d
 
 
 class JobManager:

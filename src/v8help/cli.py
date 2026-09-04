@@ -13,16 +13,7 @@ from v8help.indexer import run_build
 from v8help.search.fts import FtsBackend
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="v8help",
-        description="Инструмент для индексации и поиска по справке 1С (.hbk)",
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--config", metavar="PATH", help="путь к TOML-конфигу")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-
+def _add_build_parser(sub) -> None:
     p = sub.add_parser("build", help="распаковать .hbk, собрать корпус и индекс")
     p.add_argument("--sources", nargs="*", help="источники для сборки (по умолчанию из конфига)")
     p.add_argument("--lang", help="язык: ru/en (по умолчанию из конфига)")
@@ -31,12 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, help="целевой размер чанка в символах")
     p.add_argument("--chunk-overlap", type=int, help="перекрытие соседних чанков в символах")
 
-    p = sub.add_parser("search", help="поиск по справке")
-    p.add_argument("query", help="поисковый запрос")
-    p.add_argument("--section", help="фильтр по разделу")
-    p.add_argument("--kind", help="фильтр по kind")
-    p.add_argument("--limit", type=int, default=None, help="максимум результатов")
 
+def _add_view_parsers(sub) -> None:
     p = sub.add_parser("get-page", help="полный текст страницы")
     p.add_argument("id", help="идентификатор страницы (filename или числовой id)")
     p.add_argument("--chunk", type=int, default=None, help="номер чанка длинной статьи (0-based)")
@@ -47,11 +34,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("related", help="связанные страницы")
     p.add_argument("id", help="идентификатор страницы")
 
+
+def _add_serve_parser(sub) -> None:
     p = sub.add_parser("serve", help="запустить MCP-сервер (stdio или --http)")
     p.add_argument("--http", action="store_true", help="HTTP-транспорт (streamable-http) вместо stdio")
     p.add_argument("--host", default=None, help="адрес для HTTP (по умолчанию 127.0.0.1)")
     p.add_argument("--port", type=int, default=None, help="порт для HTTP (по умолчанию 8000)")
 
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="v8help",
+        description="Инструмент для индексации и поиска по справке 1С (.hbk)",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--config", metavar="PATH", help="путь к TOML-конфигу")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("search", help="поиск по справке")
+    p.add_argument("query", help="поисковый запрос")
+    p.add_argument("--section", help="фильтр по разделу")
+    p.add_argument("--kind", help="фильтр по kind")
+    p.add_argument("--limit", type=int, default=None, help="максимум результатов")
+
+    _add_build_parser(sub)
+    _add_view_parsers(sub)
+    _add_serve_parser(sub)
     return parser
 
 
@@ -138,6 +147,21 @@ def _search(args, config: Config) -> int:
     return 0
 
 
+def _print_page_chunk(conn, row, chunk_index: int) -> int:
+    chunk = conn.execute(
+        "SELECT title, body FROM chunks WHERE page_id=? AND chunk_index=?",
+        (row["id"], chunk_index),
+    ).fetchone()
+    if chunk is None:
+        print(f"Чанк {chunk_index} не найден (статья не разбита или номер вне диапазона).",
+              file=sys.stderr)
+        return 1
+    print(f"# {row['title']} [чанк {chunk_index}]")
+    print()
+    print(chunk["body"])
+    return 0
+
+
 def _get_page(args, config: Config) -> int:
     db = _require_db(config)
     if db is None:
@@ -149,18 +173,7 @@ def _get_page(args, config: Config) -> int:
             print(f"Страница не найдена: {args.id}", file=sys.stderr)
             return 1
         if args.chunk is not None:
-            chunk = conn.execute(
-                "SELECT title, body FROM chunks WHERE page_id=? AND chunk_index=?",
-                (row["id"], args.chunk),
-            ).fetchone()
-            if chunk is None:
-                print(f"Чанк {args.chunk} не найден (статья не разбита или номер вне диапазона).",
-                      file=sys.stderr)
-                return 1
-            print(f"# {row['title']} [чанк {args.chunk}]")
-            print()
-            print(chunk["body"])
-            return 0
+            return _print_page_chunk(conn, row, args.chunk)
         print(f"# {row['title']}")
         print(f"id={row['id']} section={row['section']} kind={row['kind']} source={row['hbk_source']}")
         print()

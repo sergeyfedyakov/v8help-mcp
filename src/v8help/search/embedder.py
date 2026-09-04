@@ -65,31 +65,25 @@ class Embedder:
         except urllib.error.URLError as exc:
             raise EmbedderError(f"Недоступен {url}: {exc.reason}") from exc
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Эмбеддинги для списка текстов (один запрос, батч)."""
-        if not texts:
-            return []
-        if not self.configured:
-            raise EmbedderError("Эмбеддер не настроен (нет model/base_url)")
-        if self.native_hf:
-            url = (
-                f"{self.base_url}/{self.config.model}/pipeline/feature-extraction"
-            )
-            data = self._post_json(url, {"inputs": texts})
-            if isinstance(data, list) and data and isinstance(data[0], list):
-                vecs = data
-            elif isinstance(data, list) and data and isinstance(data[0], float):
-                vecs = [data]
-            else:
-                raise EmbedderError(
-                    f"Неожиданный формат ответа {type(data).__name__} от {url}"
-                )
-        else:
-            url = f"{self.base_url}/embeddings"
-            data = self._post_json(url, {"model": self.config.model, "input": texts})
-            if not isinstance(data, dict):
-                raise EmbedderError(f"Неожиданный формат ответа от {url}")
-            vecs = [item["embedding"] for item in data.get("data", [])]
+    def _embed_hf(self, texts: list[str]) -> list[list[float]]:
+        url = f"{self.base_url}/{self.config.model}/pipeline/feature-extraction"
+        data = self._post_json(url, {"inputs": texts})
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], float):
+            return [data]
+        raise EmbedderError(
+            f"Неожиданный формат ответа {type(data).__name__} от {url}"
+        )
+
+    def _embed_openai(self, texts: list[str]) -> list[list[float]]:
+        url = f"{self.base_url}/embeddings"
+        data = self._post_json(url, {"model": self.config.model, "input": texts})
+        if not isinstance(data, dict):
+            raise EmbedderError(f"Неожиданный формат ответа от {url}")
+        return [item["embedding"] for item in data.get("data", [])]
+
+    def _check_vecs(self, texts: list[str], vecs: list[list[float]]) -> None:
         if len(vecs) != len(texts):
             raise EmbedderError(
                 f"Ожидалось {len(texts)} векторов, получено {len(vecs)}"
@@ -98,6 +92,15 @@ class Embedder:
             raise EmbedderError(
                 f"Размерность {len(vecs[0])} != ожидаемой {self.config.dims}"
             )
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Эмбеддинги для списка текстов (один запрос, батч)."""
+        if not texts:
+            return []
+        if not self.configured:
+            raise EmbedderError("Эмбеддер не настроен (нет model/base_url)")
+        vecs = self._embed_hf(texts) if self.native_hf else self._embed_openai(texts)
+        self._check_vecs(texts, vecs)
         return vecs
 
     def embed_one(self, text: str) -> list[float]:
@@ -116,34 +119,53 @@ class Embedder:
         обрабатывает параллельные запросы), прогресс — через потокобезопасный
         счётчик. Результаты возвращаются в исходном порядке.
         """
-        bs = batch_size or self.config.batch_size or 64
         n = len(texts)
         if n == 0:
             return []
+        bs = batch_size or self.config.batch_size or 64
         if threads <= 1:
             return self._embed_sequential(texts, bs, on_batch)
+        return self._embed_threaded(texts, bs, on_batch, threads)
 
+    def _embed_range(
+        self,
+        texts: list[str],
+        out: list[list[float]],
+        start: int,
+        end: int,
+        bs: int,
+        lock: threading.Lock,
+        counter: list[int],
+        on_batch: BatchProgress | None,
+        n: int,
+    ) -> None:
+        i = start
+        while i < end:
+            vecs = self.embed(texts[i : i + bs])
+            with lock:
+                out[i : i + bs] = vecs
+                counter[0] += len(vecs)
+                if on_batch is not None:
+                    on_batch(counter[0], n)
+            i += bs
+
+    def _embed_threaded(
+        self,
+        texts: list[str],
+        bs: int,
+        on_batch: BatchProgress | None,
+        threads: int,
+    ) -> list[list[float]]:
+        n = len(texts)
         out: list[list[float]] = [None] * n  # type: ignore[list-item]
         lock = threading.Lock()
-        done = 0
+        counter = [0]
         nthreads = max(1, min(int(threads), n))
         chunk = (n + nthreads - 1) // nthreads
-
-        def worker(start: int, end: int) -> None:
-            nonlocal done
-            i = start
-            while i < end:
-                vecs = self.embed(texts[i : i + bs])
-                with lock:
-                    out[i : i + bs] = vecs
-                    done += len(vecs)
-                    if on_batch is not None:
-                        on_batch(done, n)
-                i += bs
-
         with ThreadPoolExecutor(max_workers=nthreads) as pool:
             futures = [
-                pool.submit(worker, s, min(n, s + chunk))
+                pool.submit(self._embed_range, texts, out, s, min(n, s + chunk),
+                            bs, lock, counter, on_batch, n)
                 for s in range(0, n, chunk)
             ]
             for f in futures:

@@ -55,6 +55,56 @@ def _lookup(conn, identifier: Any) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _section_groups(conn, section: str) -> dict:
+    """Группы страниц раздела: топ-префикс filename (до первой точки) → число."""
+    rows = conn.execute(
+        "SELECT filename FROM pages WHERE section=? ORDER BY filename",
+        (section,),
+    ).fetchall()
+    groups: dict[str, int] = {}
+    for r in rows:
+        stem = r["filename"][:-3] if r["filename"].endswith(".md") else r["filename"]
+        top = stem.split(".", 1)[0]
+        groups[top] = groups.get(top, 0) + 1
+    return {
+        "section": section,
+        "groups": [{"name": k, "count": v} for k, v in sorted(groups.items())],
+    }
+
+
+def _index_stats(db: Database) -> dict:
+    """Счётчики pages/links/chunks/vectors + meta из собранной БД."""
+    conn = db.connect()
+    try:
+        def count(table: str) -> int:
+            has = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] if has else 0
+
+        return {
+            "pages": count("pages"),
+            "links": count("links"),
+            "chunks": count("chunks"),
+            "vectors": count("vectors"),
+            "meta": dict(conn.execute("SELECT key, value FROM meta").fetchall()),
+        }
+    finally:
+        conn.close()
+
+
+def _require_bin_dir(cfg: Config) -> str:
+    """Строка bin_dir для build без sources; ошибка, если он не найден."""
+    bin_dir = str(cfg.resolve_bin_dir() or "")
+    if bin_dir in ("", "."):
+        raise RuntimeError(
+            "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
+            "конфиге или проверьте установку платформы 1С."
+        )
+    return bin_dir
+
+
 class _Tools:
     """Обработчики инструментов MCP (закрыты поверх готовой БД)."""
 
@@ -95,6 +145,69 @@ class _Tools:
             return self._get_page_one(ident, chunk_index)
         raise ValueError("id должен быть строкой или массивом строк")
 
+    @staticmethod
+    def _legacy_page(page: sqlite3.Row) -> dict:
+        """Старая БД без чанков — отдать страницу целиком, как раньше."""
+        return {
+            "id": page["id"], "filename": page["filename"], "title": page["title"],
+            "section": page["section"], "kind": page["kind"],
+            "hbk_source": page["hbk_source"], "body": page["body"],
+        }
+
+    @staticmethod
+    def _page_chunks(conn, page_id: int) -> list[sqlite3.Row] | None:
+        """Список чанков страницы (без тел) или None, если таблицы нет."""
+        has_chunks = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
+        ).fetchone()
+        if not has_chunks:
+            return None
+        return conn.execute(
+            "SELECT id, chunk_index, chars FROM chunks"
+            " WHERE page_id=? ORDER BY chunk_index",
+            (page_id,),
+        ).fetchall()
+
+    @staticmethod
+    def _chunk_body(conn, chunk_id: int) -> str:
+        return conn.execute(
+            "SELECT body FROM chunks WHERE id=?", (chunk_id,)
+        ).fetchone()["body"]
+
+    def _pick_chunk_body(self, conn, page, chunks, chunk_index) -> tuple[str, bool]:
+        """(body, truncated) для запрошенного чанка или для начала длинной статьи."""
+        total = len(chunks)
+        if chunk_index is not None:
+            row = next((c for c in chunks if c["chunk_index"] == int(chunk_index)), None)
+            if row is None:
+                raise ValueError(f"Чанк {chunk_index} не найден (всего {total})")
+            return self._chunk_body(conn, row["id"]), total > 1
+        body = page["body"]
+        truncated = total > 1 or len(body) > _PAGE_CHARS_LIMIT
+        if truncated:
+            body = self._chunk_body(conn, chunks[0]["id"])
+            truncated = total > 1 or len(page["body"]) > _PAGE_CHARS_LIMIT
+        return body, truncated
+
+    @staticmethod
+    def _page_dict(page, chunks, body, truncated, chunk_index) -> dict:
+        return {
+            "id": page["id"],
+            "filename": page["filename"],
+            "title": page["title"],
+            "section": page["section"],
+            "kind": page["kind"],
+            "hbk_source": page["hbk_source"],
+            "chars": len(page["body"]),
+            "chunk_index": chunk_index if chunk_index is not None else 0,
+            "total_chunks": len(chunks),
+            "truncated": truncated,
+            "chunks": [
+                {"index": c["chunk_index"], "chars": c["chars"]} for c in chunks
+            ],
+            "body": body,
+        }
+
     def _get_page_one(self, ident: str, chunk_index=None) -> dict:
         db = Database(self.db_path)
         conn = db.connect()
@@ -102,73 +215,11 @@ class _Tools:
             page = _lookup(conn, ident)
             if page is None:
                 raise ValueError(f"Страница не найдена: {ident}")
-            has_chunks = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
-            ).fetchone()
-            if not has_chunks:
-                # Старая БД без чанков — отдать целиком, как раньше.
-                return {
-                    "id": page["id"],
-                    "filename": page["filename"],
-                    "title": page["title"],
-                    "section": page["section"],
-                    "kind": page["kind"],
-                    "hbk_source": page["hbk_source"],
-                    "body": page["body"],
-                }
-            chunks = conn.execute(
-                "SELECT id, chunk_index, chars FROM chunks"
-                " WHERE page_id=? ORDER BY chunk_index",
-                (page["id"],),
-            ).fetchall()
+            chunks = self._page_chunks(conn, page["id"])
             if not chunks:
-                # Старая БД без чанков — отдать целиком, как раньше.
-                return {
-                    "id": page["id"],
-                    "filename": page["filename"],
-                    "title": page["title"],
-                    "section": page["section"],
-                    "kind": page["kind"],
-                    "hbk_source": page["hbk_source"],
-                    "body": page["body"],
-                }
-            total = len(chunks)
-            if chunk_index is not None:
-                row = next((c for c in chunks if c["chunk_index"] == int(chunk_index)), None)
-                if row is None:
-                    raise ValueError(
-                        f"Чанк {chunk_index} не найден (всего {total})"
-                    )
-                body = conn.execute(
-                    "SELECT body FROM chunks WHERE id=?", (row["id"],)
-                ).fetchone()["body"]
-                truncated = total > 1
-            else:
-                body = page["body"]
-                truncated = False
-                if total > 1 or len(body) > _PAGE_CHARS_LIMIT:
-                    first = chunks[0]
-                    body = conn.execute(
-                        "SELECT body FROM chunks WHERE id=?", (first["id"],)
-                    ).fetchone()["body"]
-                    truncated = total > 1 or len(page["body"]) > _PAGE_CHARS_LIMIT
-            return {
-                "id": page["id"],
-                "filename": page["filename"],
-                "title": page["title"],
-                "section": page["section"],
-                "kind": page["kind"],
-                "hbk_source": page["hbk_source"],
-                "chars": len(page["body"]),
-                "chunk_index": chunk_index if chunk_index is not None else 0,
-                "total_chunks": total,
-                "truncated": truncated,
-                "chunks": [
-                    {"index": c["chunk_index"], "chars": c["chars"]}
-                    for c in chunks
-                ],
-                "body": body,
-            }
+                return self._legacy_page(page)
+            body, truncated = self._pick_chunk_body(conn, page, chunks, chunk_index)
+            return self._page_dict(page, chunks, body, truncated, chunk_index)
         finally:
             conn.close()
 
@@ -204,28 +255,12 @@ class _Tools:
         conn = db.connect()
         try:
             if section:
-                rows = conn.execute(
-                    "SELECT filename FROM pages WHERE section=? ORDER BY filename",
-                    (section,),
-                ).fetchall()
-                groups: dict[str, int] = {}
-                for r in rows:
-                    stem = r["filename"][:-3] if r["filename"].endswith(".md") else r["filename"]
-                    top = stem.split(".", 1)[0]
-                    groups[top] = groups.get(top, 0) + 1
-                return {
-                    "section": section,
-                    "groups": [
-                        {"name": k, "count": v} for k, v in sorted(groups.items())
-                    ],
-                }
+                return _section_groups(conn, section)
             rows = conn.execute(
                 "SELECT section, COUNT(*) AS n FROM pages GROUP BY section ORDER BY section"
             ).fetchall()
             return {
-                "sections": [
-                    {"section": r["section"], "count": r["n"]} for r in rows
-                ]
+                "sections": [{"section": r["section"], "count": r["n"]} for r in rows]
             }
         finally:
             conn.close()
@@ -261,31 +296,29 @@ class _Tools:
 
     # --- build / build_status ---
 
+    @staticmethod
+    def _narrow_sources(cfg: Config, idset: set[str]) -> None:
+        if cfg.sources:
+            cfg.sources = [s for s in cfg.sources if s.id in idset]
+        else:
+            cfg.books = [b for b in cfg.books if b in idset]
+
     def build(self, sources=None, lang=None, cleanup=None, force=False,
               chunk_size=None, chunk_overlap=None) -> dict:
         cfg = dataclasses.replace(self.config)
         if sources:
-            idset = {str(x) for x in sources}
-            if cfg.sources:
-                cfg.sources = [s for s in cfg.sources if s.id in idset]
-            else:
-                cfg.books = [b for b in cfg.books if b in idset]
+            self._narrow_sources(cfg, {str(x) for x in sources})
         if lang:
             cfg.lang = str(lang)
-        force = bool(force)
-        cleanup = bool(cleanup) if cleanup is not None else None
         if chunk_size is not None:
             cfg.build.chunk_size = int(chunk_size)
         if chunk_overlap is not None:
             cfg.build.chunk_overlap = int(chunk_overlap)
+        force = bool(force)
+        cleanup = bool(cleanup) if cleanup is not None else None
         bin_dir = ""
         if not cfg.sources:
-            bin_dir = str(cfg.resolve_bin_dir() or "")
-            if bin_dir in ("", "."):
-                raise RuntimeError(
-                    "bin_dir не задан и не найден автоматически. Укажите bin_dir в "
-                    "конфиге или проверьте установку платформы 1С."
-                )
+            bin_dir = _require_bin_dir(cfg)
         job = get_manager().start(cfg, force=force, cleanup=cleanup)
         return {"job_id": job.id, "status": "started", "bin_dir": bin_dir}
 
@@ -301,40 +334,10 @@ class _Tools:
         db = Database(self.db_path)
         index: dict = {"exists": db.exists()}
         if db.exists():
-            conn = db.connect()
-            try:
-                meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-                pages = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-                links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
-                has_chunks = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
-                ).fetchone()
-                chunks = (
-                    conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                    if has_chunks else 0
-                )
-                has_vectors = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors'"
-                ).fetchone()
-                vectors = (
-                    conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
-                    if has_vectors else 0
-                )
-            finally:
-                conn.close()
-            index.update(
-                {
-                    "pages": pages,
-                    "links": links,
-                    "chunks": chunks,
-                    "vectors": vectors,
-                    "meta": meta,
-                }
-            )
+            index.update(_index_stats(db))
         bd = self.config.resolve_bin_dir()
-        bin_dir = str(bd) if str(bd) not in ("", ".") else ""
         return {
-            "bin_dir": bin_dir,
+            "bin_dir": str(bd) if str(bd) not in ("", ".") else "",
             "bin_dir_explicit": str(self.config.bin_dir) not in ("", "."),
             "platforms": discover_platforms(),
             "embedders": discover_embedders(),
@@ -371,31 +374,50 @@ def _coerce_bool(v) -> bool:
     return bool(v)
 
 
+def _set_search_value(config: Config, name: str, value, key: str) -> None:
+    if name == "backend":
+        v = str(value).lower()
+        if v not in ("fts", "hybrid", "vectors"):
+            raise ValueError(f"search.backend: fts|hybrid|vectors, получено {value!r}")
+        config.search.backend = v
+    elif name == "limit":
+        config.search.limit = int(value)
+    elif name == "max_chunks_per_page":
+        config.search.max_chunks_per_page = int(value)
+    else:
+        raise KeyError(key)
+
+
+def _set_build_value(config: Config, name: str, value, key: str) -> None:
+    if name == "cleanup":
+        config.build.cleanup = _coerce_bool(value)
+    elif name == "chunk_size":
+        config.build.chunk_size = int(value)
+    elif name == "chunk_overlap":
+        config.build.chunk_overlap = int(value)
+    else:
+        raise KeyError(key)
+
+
+def _set_embedder_value(config: Config, branch: str, field: str, value,
+                        key: str) -> None:
+    target = config.embedder_index if branch == "index" else config.embedder_query
+    if field in ("dims", "batch_size", "embed_chars", "threads"):
+        setattr(target, field, int(value))
+    elif field in ("model", "base_url", "api_key", "provider"):
+        setattr(target, field, str(value))
+    else:
+        raise KeyError(key)
+
+
 def _apply_config_value(config: Config, key: str, value) -> None:
     """Применяет одно плоское значение к Config (для config_set)."""
     parts = str(key).split(".")
     head = parts[0]
     if head == "search" and len(parts) == 2:
-        if parts[1] == "backend":
-            v = str(value).lower()
-            if v not in ("fts", "hybrid", "vectors"):
-                raise ValueError(f"search.backend: fts|hybrid|vectors, получено {value!r}")
-            config.search.backend = v
-        elif parts[1] == "limit":
-            config.search.limit = int(value)
-        elif parts[1] == "max_chunks_per_page":
-            config.search.max_chunks_per_page = int(value)
-        else:
-            raise KeyError(key)
+        _set_search_value(config, parts[1], value, key)
     elif head == "build" and len(parts) == 2:
-        if parts[1] == "cleanup":
-            config.build.cleanup = _coerce_bool(value)
-        elif parts[1] == "chunk_size":
-            config.build.chunk_size = int(value)
-        elif parts[1] == "chunk_overlap":
-            config.build.chunk_overlap = int(value)
-        else:
-            raise KeyError(key)
+        _set_build_value(config, parts[1], value, key)
     elif head == "bin_dir":
         config.bin_dir = Path(str(value))
     elif head == "lang":
@@ -403,14 +425,7 @@ def _apply_config_value(config: Config, key: str, value) -> None:
     elif head == "books":
         config.books = [str(x) for x in value]
     elif head == "embedder" and len(parts) == 3 and parts[1] in ("index", "query"):
-        target = config.embedder_index if parts[1] == "index" else config.embedder_query
-        field = parts[2]
-        if field in ("dims", "batch_size", "embed_chars", "threads"):
-            setattr(target, field, int(value))
-        elif field in ("model", "base_url", "api_key", "provider"):
-            setattr(target, field, str(value))
-        else:
-            raise KeyError(key)
+        _set_embedder_value(config, parts[1], parts[2], value, key)
     else:
         raise KeyError(key)
 
@@ -544,31 +559,32 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
     return mcp
 
 
+def _load_config_at(path: Path) -> tuple[Config, str] | None:
+    """(Config, путь), если файл есть и читается; иначе None (ошибка — в stderr)."""
+    if not path.exists():
+        return None
+    try:
+        return Config.load(path), str(path)
+    except Exception as exc:
+        print(f"[v8help] ошибка чтения {path}: {exc}", file=sys.stderr)
+        return None
+
+
 def load_config(config_arg: str | None) -> tuple[Config, str | None]:
     """Загрузка конфига. Порядок: --config > V8HELP_CONFIG > ./v8help.toml
     > PROJECT_ROOT/v8help.toml > defaults. Возвращает (config, config_path)."""
-    path = config_arg
-    if not path:
-        env = os.environ.get("V8HELP_CONFIG")
-        if env:
-            path = env
+    path = config_arg or os.environ.get("V8HELP_CONFIG")
     if path:
         p = Path(path)
-        if p.exists():
-            try:
-                return Config.load(p), str(p)
-            except Exception as exc:
-                print(f"[v8help] ошибка чтения {p}: {exc}", file=sys.stderr)
-                return Config(), None
-        print(f"[v8help] config не найден: {p} — использую defaults", file=sys.stderr)
-        return Config(), None
+        loaded = _load_config_at(p)
+        if loaded is None:
+            if not p.exists():
+                print(f"[v8help] config не найден: {p} — использую defaults", file=sys.stderr)
+            return Config(), None
+        return loaded
     for cand in (Path.cwd() / "v8help.toml", PROJECT_ROOT / "v8help.toml"):
         if cand.exists():
-            try:
-                return Config.load(cand), str(cand)
-            except Exception as exc:
-                print(f"[v8help] ошибка чтения {cand}: {exc}", file=sys.stderr)
-                return Config(), None
+            return _load_config_at(cand) or (Config(), None)
     return Config(), None
 
 

@@ -58,6 +58,21 @@ def _read_meta(db_path: Path) -> dict[str, str]:
         conn.close()
 
 
+def _embed_meta_matches(config: Config, meta: dict[str, str]) -> bool:
+    """В мета согласованы модель/dims/embed_chars с ``embedder.index``.
+
+    Без настроенного эмбеддера всегда True.
+    """
+    e = config.embedder_index
+    if not (e.base_url and e.model):
+        return True
+    return (
+        meta.get("embed_model") == e.model
+        and meta.get("embed_dims") == str(e.dims)
+        and meta.get("embed_chars") == str(e.embed_chars)
+    )
+
+
 def _is_up_to_date(config: Config) -> bool:
     db = Path(config.db_path)
     if not db.exists():
@@ -69,25 +84,20 @@ def _is_up_to_date(config: Config) -> bool:
     for src in config.resolve_sources():
         if src.hbk.exists() and src.hbk.stat().st_mtime > db_mtime:
             return False
-    # Если эмбеддер задан/поменялся — векторы могли устареть.
-    e = config.embedder_index
     try:
         meta = _read_meta(db)
     except Exception:
         return False
-    if e.base_url and e.model:
-        if (
-            meta.get("embed_model") != e.model
-            or meta.get("embed_dims") != str(e.dims)
-            or meta.get("embed_chars") != str(e.embed_chars)
-        ):
-            return False
-    elif meta.get("embed_model"):
-        # Векторы были, а теперь эмбеддер отключён — пересобрать без них.
+    # Если эмбеддер задан/поменялся — векторы могли устареть; если отключён,
+    # а векторы были — пересобрать без них.
+    if not _embed_meta_matches(config, meta):
         return False
-    if meta.get("chunk_size") != str(config.build.chunk_size):
+    if meta.get("embed_model") and not (
+        config.embedder_index.base_url and config.embedder_index.model
+    ):
         return False
-    if meta.get("chunk_overlap") != str(config.build.chunk_overlap):
+    if (meta.get("chunk_size") != str(config.build.chunk_size)
+            or meta.get("chunk_overlap") != str(config.build.chunk_overlap)):
         return False
     return True
 
@@ -101,6 +111,52 @@ def _atomic_replace(src: Path, dst: Path) -> None:
             if attempt == 9:
                 raise
             time.sleep(0.05)
+
+
+def _index_page_row(db, conn, path, filenames):
+    """Вставляет строку pages и исходящие ссылки. Возвращает (title, text, page_id, links)."""
+    name = _stem(path.name)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    title = metadata.extract_title(text, name)
+    page_id = db.insert_page(
+        conn, name, title, metadata.detect_section(name),
+        metadata.detect_kind(name), metadata.detect_source(name), "", text,
+        lex.expand(title), lex.expand(text),
+    )
+    dsts = [d for d in metadata.parse_links(text) if d in filenames and d != name]
+    db.insert_links(conn, name, dsts)
+    return title, text, page_id, len(dsts)
+
+
+def _index_one_file(db, conn, path, filenames, chunk_size, chunk_overlap, enqueue_embeds):
+    """md → page+chunks+ссылки; возвращает (links, chunks)."""
+    title, text, page_id, links = _index_page_row(db, conn, path, filenames)
+    desc = metadata.extract_description(text)
+    parts = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+    src = "page" if len(parts) == 1 else "chunk"
+    ids = [db.insert_chunk(conn, page_id, i, title, b, src, desc)
+           for i, b in enumerate(parts)]
+    if len(ids) > 1:
+        db.link_chunks(conn, ids)
+    if enqueue_embeds:
+        db.enqueue_chunks(conn, [(cid, title, b) for cid, b in zip(ids, parts)])
+    return links, len(ids)
+
+
+def _write_corpus_meta(conn, pages: int, extra_meta: dict[str, str] | None) -> None:
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('indexed_at',?)",
+        (str(int(time.time())),),
+    )
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('pages',?)",
+        (str(pages),),
+    )
+    for key, value in (extra_meta or {}).items():
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?)",
+            (key, str(value)),
+        )
 
 
 def _index_corpus(
@@ -122,50 +178,13 @@ def _index_corpus(
         filenames = {_stem(p.name) for p in files}
         conn.execute("BEGIN")
         for p in files:
-            text = p.read_text(encoding="utf-8", errors="replace")
-            name = _stem(p.name)
-            title = metadata.extract_title(text, name)
-            section = metadata.detect_section(name)
-            kind = metadata.detect_kind(name)
-            source = metadata.detect_source(name)
-            description = metadata.extract_description(text)
-            title_search = lex.expand(title)
-            body_search = lex.expand(text)
-            page_id = db.insert_page(
-                conn, name, title, section, kind, source, "", text,
-                title_search, body_search,
+            links, chunks = _index_one_file(
+                db, conn, p, filenames, chunk_size, chunk_overlap, enqueue_embeds,
             )
-            dsts = [d for d in metadata.parse_links(text) if d in filenames and d != name]
-            db.insert_links(conn, name, dsts)
-            links_total += len(dsts)
-
-            parts = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-            ids: list[int] = []
-            for idx, body in enumerate(parts):
-                src = "page" if len(parts) == 1 else "chunk"
-                cid = db.insert_chunk(
-                    conn, page_id, idx, title, body, src, description,
-                )
-                ids.append(cid)
-            if len(ids) > 1:
-                db.link_chunks(conn, ids)
-            chunks_total += len(ids)
-            if enqueue_embeds:
-                db.enqueue_chunks(conn, [(cid, title, body) for cid, body in zip(ids, parts)])
+            links_total += links
+            chunks_total += chunks
             total += 1
-        conn.execute(
-            "INSERT INTO meta(key,value) VALUES('indexed_at',?)",
-            (str(int(time.time())),),
-        )
-        conn.execute(
-            "INSERT INTO meta(key,value) VALUES('pages',?)",
-            (str(total),),
-        )
-        for key, value in (extra_meta or {}).items():
-            conn.execute(
-                "INSERT INTO meta(key,value) VALUES(?,?)",
-                (key, str(value)),
-            )
+        _write_corpus_meta(conn, total, extra_meta)
         conn.execute("COMMIT")
     except Exception:
         conn.rollback()
@@ -193,41 +212,20 @@ def _tmp_path(config: Config) -> Path:
     return config.db_path.with_name(config.db_path.name + ".tmp")
 
 
-def _resume_candidate(config: Config, tmp_db: Path) -> bool:
-    """Можно ли возобновить сборку из частично собранной tmp-БД.
-
-    Условия: tmp существует и валидна; мета (chunk_size/chunk_overlap/эмбеддер)
-    совпадает с конфигом; исходники не новее tmp; остался план ``embed_queue``
-    (или есть чанки без векторов) — т.е. эмбеддинг не завершён.
-    """
-    if not tmp_db.exists():
-        return False
-    try:
-        meta = _read_meta(tmp_db)
-    except Exception:
-        return False
+def _resume_meta_matches(config: Config, meta: dict[str, str]) -> bool:
     if meta.get("chunk_size") != str(config.build.chunk_size):
         return False
     if meta.get("chunk_overlap") != str(config.build.chunk_overlap):
         return False
     e = config.embedder_index
-    if e.base_url and e.model:
-        if (
-            meta.get("embed_model") != e.model
-            or meta.get("embed_dims") != str(e.dims)
-            or meta.get("embed_chars") != str(e.embed_chars)
-        ):
-            return False
-    else:
-        # Эмбеддер не настроен — в tmp ничего эмбеддить, нужен полный пересбор.
+    if not (e.base_url and e.model):
+        # Эмбеддер не настроен — в tmp нечего эмбеддить, нужен полный пересбор.
         return False
-    try:
-        tmp_mtime = tmp_db.stat().st_mtime
-    except OSError:
-        return False
-    for src in config.resolve_sources():
-        if src.hbk.exists() and src.hbk.stat().st_mtime > tmp_mtime:
-            return False
+    return _embed_meta_matches(config, meta)
+
+
+def _embed_pending(tmp_db: Path) -> bool:
+    """Осталось что-то эмбеддить: план ``embed_queue`` непуст или векторы неполные."""
     db = Database(tmp_db)
     conn = db.connect()
     try:
@@ -243,22 +241,40 @@ def _resume_candidate(config: Config, tmp_db: Path) -> bool:
         return False
     finally:
         conn.close()
-    # Осталось что-то эмбеддить: план непуст или векторы неполные.
     return pending > 0 or vectors < chunks
 
 
+def _resume_candidate(config: Config, tmp_db: Path) -> bool:
+    """Можно ли возобновить сборку из частично собранной tmp-БД.
+
+    Условия: tmp существует и валидна; мета (chunk_size/chunk_overlap/эмбеддер)
+    совпадает с конфигом; исходники не новее tmp; остался план ``embed_queue``
+    (или есть чанки без векторов) — т.е. эмбеддинг не завершён.
+    """
+    if not tmp_db.exists():
+        return False
+    try:
+        meta = _read_meta(tmp_db)
+    except Exception:
+        return False
+    if not _resume_meta_matches(config, meta):
+        return False
+    try:
+        tmp_mtime = tmp_db.stat().st_mtime
+    except OSError:
+        return False
+    for src in config.resolve_sources():
+        if src.hbk.exists() and src.hbk.stat().st_mtime > tmp_mtime:
+            return False
+    return _embed_pending(tmp_db)
+
+
 def _index_vectors(config: Config, db_path: Path, emit: ProgressFn) -> int:
-    """Считает эмбеддинги чанков и пишет нормализованные векторы в tmp-БД.
+    """Эмбеддинги чанков tmp-БД по плану ``embed_queue`` → нормализованные векторы.
 
-    Текст для эмбеддинга — ``title + "\\n" + body`` (чанк целиком, без усечения
-    ``embed_chars``: чанк уже ограничен ``chunk_size``). Батчи эмбеддятся в
-    ``threads`` потоках.
-
-    Работаем по плану ``embed_queue``: берём суперпачку, эмбеддим, пишем векторы
-    и снимаем чанки с плана в ОДНОЙ транзакции (COMMIT). Таким образом при
-    прерывании (рестарт сервера/процесса, сбой эмбеддера) теряется не более
-    одной суперпачки: уже закоммиченные векторы остаются, план в БД показывает
-    точный остаток для возобновления.
+    Текст для эмбеддинга — ``title + "\\n" + body`` без усечения (чанк уже
+    ограничен ``chunk_size``). Работаем суперпачками с коммитом на пачку — при
+    сбое возобновление с остатка плана (см. ``_embed_and_store``).
     """
     e = config.embedder_index
     if not (e.base_url and e.model):
@@ -267,51 +283,181 @@ def _index_vectors(config: Config, db_path: Path, emit: ProgressFn) -> int:
     db = Database(db_path)
     conn = db.connect()
     try:
-        pending = conn.execute("SELECT COUNT(*) FROM embed_queue").fetchone()[0]
-        if pending == 0:
+        total = conn.execute("SELECT COUNT(*) FROM embed_queue").fetchone()[0]
+        if total == 0:
             return conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
-        total = pending
-        bs = e.batch_size or 64
-        threads = max(1, e.threads or 1)
-        # Суперпачка: несколько батчей на поток, чтобы COMMIT был не слишком частым.
-        super_batch = max(bs * threads * 2, bs)
         emit("embed", f"Эмбеддинги {total} чанков ({e.model})")
-        done = 0
-        while True:
-            rows = conn.execute(
-                "SELECT chunk_id, title, body FROM embed_queue"
-                " ORDER BY chunk_id LIMIT ?",
-                (super_batch,),
-            ).fetchall()
-            if not rows:
-                break
-            ids = [r["chunk_id"] for r in rows]
-            texts = [f"{r['title']}\n{r['body']}" for r in rows]
-            vecs = embedder.embed_batches(
-                texts,
-                threads=threads,
-                on_batch=lambda d, t: None,
-            )
-            blob_rows = []
-            for cid, v in zip(ids, vecs):
-                arr = np.asarray(v, dtype=np.float32)
-                n = float(np.linalg.norm(arr))
-                if n:
-                    arr = arr / n
-                blob_rows.append((cid, arr.tobytes()))
-            conn.execute("BEGIN")
-            try:
-                db.insert_vectors(conn, blob_rows)
-                db.dequeue_chunks(conn, ids)
-                conn.execute("COMMIT")
-            except Exception:
-                conn.rollback()
-                raise
-            done += len(ids)
-            emit("embed", f"{done}/{total}")
+        _embed_loop(db, conn, embedder, e, total, emit)
         return conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
     finally:
         conn.close()
+
+
+def _embed_loop(db, conn, embedder, e, total, emit) -> None:
+    # Суперпачка: несколько батчей на поток, чтобы COMMIT был не слишком частым.
+    bs = e.batch_size or 64
+    super_batch = max(bs * max(1, e.threads or 1) * 2, bs)
+    done = 0
+    while True:
+        rows = conn.execute(
+            "SELECT chunk_id, title, body FROM embed_queue"
+            " ORDER BY chunk_id LIMIT ?",
+            (super_batch,),
+        ).fetchall()
+        if not rows:
+            break
+        _embed_and_store(db, conn, embedder, e, rows)
+        done += len(rows)
+        emit("embed", f"{done}/{total}")
+
+
+def _embed_and_store(db, conn, embedder, e, rows) -> None:
+    """Эмбеддит суперпачку: векторы и снятие чанков с плана — одной транзакцией.
+
+    При прерывании (рестарт процесса, сбой эмбеддера) теряется не более одной
+    суперпачки: закоммиченные векторы остаются, план показывает остаток.
+    """
+    ids = [r["chunk_id"] for r in rows]
+    vecs = embedder.embed_batches(
+        [f"{r['title']}\n{r['body']}" for r in rows],
+        threads=max(1, e.threads or 1),
+    )
+    blob_rows = []
+    for cid, v in zip(ids, vecs):
+        arr = np.asarray(v, dtype=np.float32)
+        n = float(np.linalg.norm(arr))
+        if n:
+            arr = arr / n
+        blob_rows.append((cid, arr.tobytes()))
+    conn.execute("BEGIN")
+    try:
+        db.insert_vectors(conn, blob_rows)
+        db.dequeue_chunks(conn, ids)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _build_extra_meta(config: Config, bd: Path) -> dict[str, str]:
+    e = config.embedder_index
+    extra: dict[str, str] = {
+        "v8help_version": __version__,
+        "platform_version": _bin_dir_version(bd),
+        "chunk_size": str(config.build.chunk_size),
+        "chunk_overlap": str(config.build.chunk_overlap),
+    }
+    if e.base_url and e.model:
+        extra["embed_model"] = e.model
+        extra["embed_dims"] = str(e.dims)
+        extra["embed_chars"] = str(e.embed_chars)
+    return extra
+
+
+def _consolidate_and_index(
+    config: Config,
+    tmp_db: Path,
+    sources: list,
+    embed_configured: bool,
+    extra_meta: dict[str, str],
+    on_progress: ProgressFn | None,
+    emit: ProgressFn,
+) -> tuple[int, int, int]:
+    """Полная сборка: конвертация корпуса в md + индексация страниц в tmp-БД."""
+    corpus = config.corpus_dir
+    emit("consolidate", f"Консолидация корпуса ({len(sources)} источников)")
+    consolidate(config, on_progress)
+
+    files = sorted(corpus.glob("*.md"))
+    emit("index", f"Индексация {len(files)} страниц")
+
+    for stale in config.db_path.parent.glob(config.db_path.name + ".tmp-*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    if tmp_db.exists():
+        tmp_db.unlink()
+    return _index_corpus(
+        config, tmp_db, files, extra_meta, enqueue_embeds=embed_configured,
+    )
+
+
+def _tmp_counts(tmp_db: Path) -> tuple[int, int, int]:
+    """Счётчики pages/links/chunks из готовой tmp-БД (resume-режим)."""
+    db = Database(tmp_db)
+    conn = db.connect()
+    try:
+        return (
+            conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM links").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+def _fill_result(
+    result: BuildResult,
+    config: Config,
+    counts: tuple[int, int, int],
+    vectors: int,
+    embed_configured: bool,
+    started: float,
+) -> None:
+    e = config.embedder_index
+    result.pages, result.links, result.chunks = counts
+    result.vectors = vectors
+    result.embed_model = e.model if embed_configured else ""
+    result.embed_dims = e.dims if embed_configured else 0
+    result.embed_chars = e.embed_chars if embed_configured else 0
+    result.chunk_size = config.build.chunk_size
+    result.chunk_overlap = config.build.chunk_overlap
+    result.threads = e.threads if embed_configured else 0
+    result.duration_sec = round(time.time() - started, 2)
+
+
+def _build_in_tmp(config, tmp_db, sources, bd, embed_configured, resumed,
+                  on_progress, emit):
+    """Готовит содержимое tmp-БД: корпус+чанки (или resume) и векторы.
+
+    Возвращает (counts pages/links/chunks, vectors). Подмену целевой БД делает
+    вызывающий (run_build).
+    """
+    if resumed:
+        vectors = _index_vectors(config, tmp_db, emit) if embed_configured else 0
+        # В resume-режиме счётчики читаем из готовой tmp-БД до подмены.
+        return _tmp_counts(tmp_db), vectors
+    counts = _consolidate_and_index(
+        config, tmp_db, sources, embed_configured,
+        _build_extra_meta(config, bd), on_progress, emit,
+    )
+    vectors = _index_vectors(config, tmp_db, emit) if embed_configured else 0
+    return counts, vectors
+
+
+def _finish_build(result, config, tmp_db, counts, vectors, embed_configured,
+                  started, emit):
+    _atomic_replace(tmp_db, config.db_path)
+    if config.build.cleanup:
+        shutil.rmtree(config.corpus_dir, ignore_errors=True)
+    _fill_result(result, config, counts, vectors, embed_configured, started)
+    done_msg = f"Готово: {counts[0]} страниц, {counts[1]} ссылок, {counts[2]} чанков"
+    if vectors:
+        done_msg += f", {vectors} векторов"
+    emit("done", done_msg)
+
+
+def _tmp_state(config, force, emit):
+    """Путь tmp-БД, флаг настроенного эмбеддера, флаг возобновления сборки."""
+    # Фиксированное имя tmp-БД (без pid) — ради resume — см. _tmp_path.
+    tmp_db = _tmp_path(config)
+    e = config.embedder_index
+    embed_configured = bool(e.base_url and e.model)
+    resumed = not force and _resume_candidate(config, tmp_db)
+    if resumed:
+        emit("embed", "Найдена незавершённая tmp-БД, возобновление эмбеддинга")
+    return tmp_db, embed_configured, resumed
 
 
 def run_build(
@@ -324,8 +470,7 @@ def run_build(
     sources = config.resolve_sources()
     bd = config.resolve_bin_dir()
     result = BuildResult(
-        sources=len(sources),
-        db_path=str(config.db_path),
+        sources=len(sources), db_path=str(config.db_path),
         bin_dir=str(bd) if str(bd) not in ("", ".") else "",
     )
 
@@ -335,82 +480,12 @@ def run_build(
         emit("skip", "Индекс актуален, пропуск")
         return result
 
-    # Фиксированное имя tmp-БД (без pid): позволяет возобновить эмбеддинг
-    # после рестарта сервера — см. _resume_candidate.
-    tmp_db = _tmp_path(config)
-
-    e = config.embedder_index
-    embed_configured = bool(e.base_url and e.model)
-    extra_meta: dict[str, str] = {
-        "v8help_version": __version__,
-        "platform_version": _bin_dir_version(bd),
-        "chunk_size": str(config.build.chunk_size),
-        "chunk_overlap": str(config.build.chunk_overlap),
-    }
-    if embed_configured:
-        extra_meta["embed_model"] = e.model
-        extra_meta["embed_dims"] = str(e.dims)
-        extra_meta["embed_chars"] = str(e.embed_chars)
-
-    resumed = False
-    if not force and _resume_candidate(config, tmp_db):
-        # Есть частично собранная tmp-БД: корпус/чанки готовы, эмбеддинг не дописан.
-        resumed = True
-        emit("embed", "Найдена незавершённая tmp-БД, возобновление эмбеддинга")
-    else:
-        corpus = config.corpus_dir
-        emit("consolidate", f"Консолидация корпуса ({len(sources)} источников)")
-        consolidate(config, on_progress)
-
-        files = sorted(corpus.glob("*.md"))
-        emit("index", f"Индексация {len(files)} страниц")
-
-        for stale in config.db_path.parent.glob(config.db_path.name + ".tmp-*"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-        if tmp_db.exists():
-            tmp_db.unlink()
-        total, links_total, chunks_total = _index_corpus(
-            config, tmp_db, files, extra_meta, enqueue_embeds=embed_configured,
-        )
-
-    vectors = 0
-    if embed_configured:
-        vectors = _index_vectors(config, tmp_db, emit)
-
-    if resumed:
-        # В resume-режиме счётчики читаем из готовой tmp-БД до подмены.
-        db = Database(tmp_db)
-        conn = db.connect()
-        try:
-            total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-            links_total = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
-            chunks_total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        finally:
-            conn.close()
-
-    _atomic_replace(tmp_db, config.db_path)
-
-    if config.build.cleanup:
-        shutil.rmtree(corpus, ignore_errors=True)
-
-    result.pages = total
-    result.links = links_total
-    result.chunks = chunks_total
-    result.vectors = vectors
-    result.embed_model = e.model if embed_configured else ""
-    result.embed_dims = e.dims if embed_configured else 0
-    result.embed_chars = e.embed_chars if embed_configured else 0
-    result.chunk_size = config.build.chunk_size
-    result.chunk_overlap = config.build.chunk_overlap
-    result.threads = e.threads if embed_configured else 0
-    result.duration_sec = round(time.time() - started, 2)
-    done_msg = f"Готово: {total} страниц, {links_total} ссылок, {chunks_total} чанков"
-    if vectors:
-        done_msg += f", {vectors} векторов"
-    emit("done", done_msg)
+    tmp_db, embed_configured, resumed = _tmp_state(config, force, emit)
+    counts, vectors = _build_in_tmp(
+        config, tmp_db, sources, bd, embed_configured, resumed, on_progress, emit,
+    )
+    _finish_build(result, config, tmp_db, counts, vectors, embed_configured,
+                  started, emit)
     return result
 
 

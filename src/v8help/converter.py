@@ -251,6 +251,87 @@ def _strip_link(a, unresolved_log: list[tuple[str, str]], page_source_path: str,
     a.replace_with(NavigableString(a.get_text("", strip=False)))
 
 
+_KEEP_LINK = object()
+
+
+def _promote_v8help_scheme(href_s: str) -> str:
+    if href_s.lower().startswith("v8help:") and not href_s.lower().startswith("v8help://"):
+        return "v8help://" + href_s[7:].lstrip(":/")
+    return href_s
+
+
+def _v8help_link_target(
+    m: re.Match,
+    anchor: str | None,
+    archive_index: dict[str, str],
+    archive_lookup_final: dict[str, str],
+) -> tuple[str | None, str | None]:
+    anchor = m.group(3) or anchor
+    normalized = _normalize_archive_path(m.group(2).lstrip("/"))
+    if _is_degenerate_v8help_target(normalized):
+        return None, anchor
+    return (
+        _lookup_archive_target(normalized, archive_index, archive_lookup_final),
+        anchor,
+    )
+
+
+def _relative_link_target(
+    path_part: str,
+    page_source_path: str,
+    archive_index: dict[str, str],
+    archive_lookup_final: dict[str, str],
+) -> str | object | None:
+    path_part = path_part.split("?", 1)[0]
+    if not path_part:
+        return _KEEP_LINK
+    base_dir = posixpath.dirname(page_source_path)
+    resolved = _normalize_archive_path(
+        posixpath.normpath(posixpath.join(base_dir, path_part)).lstrip("/")
+    )
+    return _lookup_archive_target(resolved, archive_index, archive_lookup_final)
+
+
+def _is_external_href(href_s: str) -> bool:
+    if href_s.lower().startswith(("http://", "https://", "mailto:", "ftp://")):
+        return True
+    return href_s.startswith("#")
+
+
+def _link_target(
+    href_raw: str,
+    page_source_path: str,
+    archive_index: dict[str, str],
+    archive_lookup_final: dict[str, str],
+) -> tuple[str | object | None, str | None, str]:
+    """(таргет .md, anchor, канонический href) для одного <a>.
+
+    Таргет: имя файла, ``_KEEP_LINK`` (ссылку не трогать) или ``None``
+    (не разрезолвилась — ссылку снять с логированием).
+    """
+    href_s = _promote_v8help_scheme(href_raw.strip())
+    if _is_external_href(href_s):
+        return _KEEP_LINK, None, href_s
+    path_part, _, anchor = href_s.partition("#")
+    anchor = anchor or None
+    m = V8HELP_RE.match(href_s)
+    if m:
+        target, anchor = _v8help_link_target(
+            m, anchor, archive_index, archive_lookup_final
+        )
+    else:
+        target = _relative_link_target(
+            path_part, page_source_path, archive_index, archive_lookup_final
+        )
+    return target, anchor, href_s
+
+
+def _is_primitive_target(target_filename: str) -> bool:
+    stem = target_filename[:-3] if target_filename.endswith(".md") else target_filename
+    stem = stem.rsplit("/", 1)[-1]
+    return stem in PRIMITIVE_TYPE_STEMS or stem.startswith("lang__def_")
+
+
 def rewrite_links(
     soup: BeautifulSoup,
     archive_index: dict[str, str],
@@ -265,46 +346,18 @@ def rewrite_links(
         href = a.get("href")
         if not href:
             continue
-        href_s = href.strip()
-        if href_s.lower().startswith(("http://", "https://", "mailto:", "ftp://")):
+        target, anchor, href_s = _link_target(
+            href, page_source_path, archive_index, archive_lookup_final
+        )
+        if target is _KEEP_LINK:
             continue
-        if href_s.startswith("#"):
-            continue
-        if href_s.lower().startswith("v8help:") and not href_s.lower().startswith("v8help://"):
-            href_s = "v8help://" + href_s[7:].lstrip(":/")
-        path_part, _, anchor = href_s.partition("#")
-        anchor = anchor or None
-        m = V8HELP_RE.match(href_s)
-        target_filename: str | None = None
-        if m:
-            raw_target = m.group(2)
-            anchor = m.group(3) or anchor
-            normalized = _normalize_archive_path(raw_target.lstrip("/"))
-            if _is_degenerate_v8help_target(normalized):
-                _strip_link(a, unresolved_log, page_source_path, href_s)
-                continue
-            target_filename = _lookup_archive_target(normalized, archive_index, archive_lookup_final)
-        else:
-            path_part = path_part.split("?", 1)[0]
-            if not path_part:
-                continue
-            base_dir = posixpath.dirname(page_source_path)
-            resolved = _normalize_archive_path(
-                posixpath.normpath(posixpath.join(base_dir, path_part)).lstrip("/")
-            )
-            target_filename = _lookup_archive_target(resolved, archive_index, archive_lookup_final)
-        if not target_filename:
+        if not target:
             _strip_link(a, unresolved_log, page_source_path, href_s)
             continue
-        stem = target_filename[:-3] if target_filename.endswith(".md") else target_filename
-        stem = stem.rsplit("/", 1)[-1]
-        if stem in PRIMITIVE_TYPE_STEMS or stem.startswith("lang__def_"):
+        if _is_primitive_target(target):
             a.replace_with(NavigableString(a.get_text("", strip=False)))
             continue
-        new_href = target_filename
-        if anchor:
-            new_href += "#" + anchor
-        a["href"] = new_href
+        a["href"] = target + ("#" + anchor if anchor else "")
 
 
 # ---------- Markdown -----------------------------------------------------
@@ -352,6 +405,47 @@ def write_md(out_dir: Path, filename: str, body: str) -> None:
 
 # ---------- Индекс архива ------------------------------------------------
 
+def _collect_title_pairs(
+    extracted_dir: Path,
+    title_map: dict[str, str],
+) -> tuple[list[tuple[str, str]], Counter]:
+    pairs: list[tuple[str, str]] = []
+    title_counts: Counter[str] = Counter()
+    for html in iter_html(extracted_dir):
+        rel = html.relative_to(extracted_dir).as_posix()
+        title = title_map.get(rel.lower(), "")
+        pairs.append((rel, title))
+        if title:
+            title_counts[title] += 1
+    return pairs, title_counts
+
+
+def _title_target(
+    rel: str,
+    title: str,
+    prefix: str,
+    title_counts: Counter,
+    title_map: dict[str, str],
+) -> str:
+    target = ""
+    if title:
+        m = PAGETITLE_SPLIT_RE.match(title)
+        ru_title = m.group(1).strip() if m else title
+        if title_counts[title] > 1:
+            parent = resolve_parent_title(rel, title_map)
+            if parent:
+                mp = PAGETITLE_SPLIT_RE.match(parent)
+                ru_parent = mp.group(1).strip() if mp else parent
+                target = title_to_filename(ru_parent + "." + ru_title, prefix=prefix)
+            else:
+                target = archive_path_to_filename(rel, prefix=prefix)
+        else:
+            target = title_to_filename(ru_title, prefix=prefix)
+    if not target:
+        target = archive_path_to_filename(rel, prefix=prefix)
+    return target
+
+
 def build_archive_index(
     extracted_dir: Path,
     prefix: str,
@@ -366,32 +460,9 @@ def build_archive_index(
             index[stem.lower()] = target
 
     if title_map is not None:
-        pairs: list[tuple[str, str]] = []
-        title_counts: Counter[str] = Counter()
-        for html in iter_html(extracted_dir):
-            rel = html.relative_to(extracted_dir).as_posix()
-            title = title_map.get(rel.lower(), "")
-            pairs.append((rel, title))
-            if title:
-                title_counts[title] += 1
+        pairs, title_counts = _collect_title_pairs(extracted_dir, title_map)
         for rel, title in pairs:
-            target = ""
-            if title:
-                m = PAGETITLE_SPLIT_RE.match(title)
-                ru_title = m.group(1).strip() if m else title
-                if title_counts[title] > 1:
-                    parent = resolve_parent_title(rel, title_map)
-                    if parent:
-                        mp = PAGETITLE_SPLIT_RE.match(parent)
-                        ru_parent = mp.group(1).strip() if mp else parent
-                        target = title_to_filename(ru_parent + "." + ru_title, prefix=prefix)
-                    else:
-                        target = archive_path_to_filename(rel, prefix=prefix)
-                else:
-                    target = title_to_filename(ru_title, prefix=prefix)
-            if not target:
-                target = archive_path_to_filename(rel, prefix=prefix)
-            _add(rel, target)
+            _add(rel, _title_target(rel, title, prefix, title_counts, title_map))
     else:
         for html in iter_html(extracted_dir):
             rel = html.relative_to(extracted_dir).as_posix()
@@ -488,12 +559,8 @@ class HbkConverter:
                 self._emit("convert", f"{src.id}: {i + 1}/{total}")
         return produced
 
-    def _convert_one(
-        self,
-        html_path: Path,
-        rel_path: str,
-        archive_index: dict[str, str],
-        src: SourceSpec,
+    def _page_filename(
+        self, rel_path: str, archive_index: dict[str, str], src: SourceSpec
     ) -> str:
         target = archive_index.get(rel_path.lower()) or archive_path_to_filename(
             rel_path, prefix=src.prefix
@@ -505,9 +572,16 @@ class HbkConverter:
         if was_collision:
             self.stats.collisions += 1
         self.used_names.add(final_name)
+        return final_name
 
-        content = read_html(html_path)
-        soup = parse_html(content)
+    def _drop_duplicate_titles(self, soup: BeautifulSoup, pagetitle_text: str) -> None:
+        title_el = soup.find(class_="V8SH_title")
+        if title_el and pagetitle_text and title_el.get_text(strip=True) == pagetitle_text:
+            title_el.decompose()
+
+    def _page_markdown(
+        self, soup: BeautifulSoup, rel_path: str, archive_index: dict[str, str]
+    ) -> str:
         unresolved: list[tuple[str, str]] = []
         rewrite_links(soup, archive_index, unresolved, rel_path, self.archive_lookup_final)
         self.stats.unresolved += len(unresolved)
@@ -517,21 +591,33 @@ class HbkConverter:
         pagetitle_text = pagetitle_el.get_text(strip=True) if pagetitle_el else ""
         if pagetitle_el:
             pagetitle_el.decompose()
-        title_el = soup.find(class_="V8SH_title")
-        if title_el and pagetitle_text and title_el.get_text(strip=True) == pagetitle_text:
-            title_el.decompose()
+        self._drop_duplicate_titles(soup, pagetitle_text)
 
         body = to_markdown(soup)
         heading = title_ru or title_en
         if heading:
             body = f"# {heading}\n\n" + body.lstrip()
-        write_md(self.out_dir, final_name, body)
+        return body
 
+    def _register_lookup(self, rel_path: str, src: SourceSpec, final_name: str) -> None:
         rel_lower = rel_path.lower()
         self.archive_lookup_final[rel_lower] = final_name
         if src.prefix:
             stem = rel_lower.rsplit(".", 1)[0]
             self.archive_lookup_final[stem] = final_name
+
+    def _convert_one(
+        self,
+        html_path: Path,
+        rel_path: str,
+        archive_index: dict[str, str],
+        src: SourceSpec,
+    ) -> str:
+        final_name = self._page_filename(rel_path, archive_index, src)
+        soup = parse_html(read_html(html_path))
+        body = self._page_markdown(soup, rel_path, archive_index)
+        write_md(self.out_dir, final_name, body)
+        self._register_lookup(rel_path, src, final_name)
         return final_name
 
 
