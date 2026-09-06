@@ -13,6 +13,7 @@ from pathlib import Path
 import uvicorn
 from fastmcp import Client
 
+from v8help import __version__
 from v8help.config import Config
 from v8help.indexer import build_index
 from v8help.server import build_server
@@ -280,7 +281,7 @@ def test_stdio_e2e(tmp_path):
         })
         resp = _stdio_recv(q, 1)
         assert resp["result"]["serverInfo"]["name"] == "v8help"
-        assert resp["result"]["serverInfo"]["version"] == "0.10.0"
+        assert resp["result"]["serverInfo"]["version"] == __version__
 
         _stdio_send(p, {"jsonrpc": "2.0", "method": "notifications/initialized"})
 

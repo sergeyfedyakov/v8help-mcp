@@ -11,7 +11,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_BOOKS = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"]
+DEFAULT_BOOKS = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru", "1cv8_ru"]
 
 # Базовые книги -> (префикс выходных имён, v8help-неймспейс).
 BOOK_META = {
@@ -20,6 +20,7 @@ BOOK_META = {
     "shquery": ("query__", "SyntaxHelperQueries"),
     "shclang": ("clang__", "SyntaxHelperCommonLanguage"),
     "dcsui": ("dcsui__", "dcsui"),
+    "1cv8": ("1cv8__", "1cv8"),
 }
 
 

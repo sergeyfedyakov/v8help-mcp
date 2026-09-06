@@ -11,6 +11,7 @@ _SECTION_BY_PREFIX = (
     ("query__", "query"),
     ("clang__", "clang"),
     ("dcsui__", "objects"),
+    ("1cv8__", "platform"),
 )
 
 _SCHEME_PREFIX = {
@@ -19,6 +20,7 @@ _SCHEME_PREFIX = {
     "SyntaxHelperCommonLanguage": "clang__",
     "SyntaxHelperContext": "",
     "dcsui": "dcsui__",
+    "1cv8": "1cv8__",
 }
 
 _LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
@@ -41,6 +43,8 @@ def detect_source(filename: str) -> str:
         return "shclang_ru"
     if filename.startswith("dcsui__"):
         return "dcsui_ru"
+    if filename.startswith("1cv8__"):
+        return "1cv8_ru"
     return "shcntx_ru"
 
 

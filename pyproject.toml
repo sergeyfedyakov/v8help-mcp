@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "v8help"
-version = "0.12.0"
+version = "0.12.1"
 description = "MCP-инструмент для чтения, индексации и поиска по файлам справки 1С (.hbk)"
 readme = "README.md"
 license = "MIT"

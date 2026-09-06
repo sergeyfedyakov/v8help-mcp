@@ -17,7 +17,7 @@ db_path = "data/v8help.db"
 lang = "ru"
 
 # Книги по умолчанию (shorthand через bin_dir)
-books = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"]
+books = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru", "1cv8_ru"]
 
 # Либо явные источники:
 # [[sources]]
@@ -113,6 +113,7 @@ limit = 10
 | `SyntaxHelperQueries`        | `query__` | `shquery_*` |
 | `SyntaxHelperCommonLanguage` | `clang__` | `shclang_*` |
 | `dcsui`                      | `dcsui__` | `dcsui_*` (справочник СКД) |
+| `1cv8`                       | `1cv8__`  | `1cv8_*` (общая документация: командная строка, пакетные режимы) |
 
 ## Готовые индексы (без установленной платформы)
 

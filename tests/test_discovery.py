@@ -83,7 +83,7 @@ def test_discover_picks_highest_with_hbk(tmp_path, monkeypatch):
 def test_resolve_sources_uses_discovered_bin_dir(tmp_path, monkeypatch):
     base = tmp_path / "1cv8"
     (base / "8.5.1.1423" / "bin").mkdir(parents=True)
-    for b in ("shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"):
+    for b in config_mod.DEFAULT_BOOKS:
         (base / "8.5.1.1423" / "bin" / f"{b}.hbk").write_bytes(b"x")
     monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
     monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
@@ -93,7 +93,7 @@ def test_resolve_sources_uses_discovered_bin_dir(tmp_path, monkeypatch):
 
     cfg = Config()
     sources = cfg.resolve_sources()
-    assert len(sources) == 4
+    assert len(sources) == len(config_mod.DEFAULT_BOOKS)
     assert all(s.hbk.exists() for s in sources)
 
 

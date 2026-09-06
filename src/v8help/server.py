@@ -448,7 +448,7 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
 
         Args:
             query: Поисковый запрос.
-            section: Фильтр по разделу: objects/tables/lang/query/clang.
+            section: Фильтр по разделу: objects/tables/lang/query/clang/platform.
             kind: Фильтр по kind: page/member/index.
             limit: Максимум результатов.
         """
@@ -479,7 +479,7 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
         """Оглавление: без section — сводка по разделам; с section — группы страниц раздела.
 
         Args:
-            section: Раздел для детализации (objects/tables/lang/query/clang).
+            section: Раздел для детализации (objects/tables/lang/query/clang/platform).
         """
         return tools.hierarchy(section=section)
 

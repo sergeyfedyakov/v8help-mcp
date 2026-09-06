@@ -38,6 +38,6 @@ def test_defaults():
     cfg = Config()
     assert cfg.search.backend == "fts"
     assert cfg.search.limit == 10
-    assert cfg.books == ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"]
+    assert cfg.books == ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru", "1cv8_ru"]
     assert cfg.embedder_index.model == ""
     assert cfg.embedder_index.dims == 0
