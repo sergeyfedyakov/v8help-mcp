@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import json
+import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +26,32 @@ from v8help.config import EmbedderConfig
 
 class EmbedderError(RuntimeError):
     pass
+
+
+def _https_context() -> ssl.SSLContext:
+    """TLS-контекст без ``VERIFY_X509_STRICT``.
+
+    Python 3.13 включает строгий режим по умолчанию, а за корпоративным
+    TLS-инспектором цепочки облачных эндпоинтов (HF-роутер) периодически не
+    проходят проверку на Authority Key Identifier. Обычная проверка цепочки и
+    имени хоста остаётся включённой.
+    """
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
+_HTTPS_CONTEXT: ssl.SSLContext | None = None
+
+
+def _context_for(url: str) -> ssl.SSLContext | None:
+    global _HTTPS_CONTEXT
+    if not url.startswith("https"):
+        return None
+    if _HTTPS_CONTEXT is None:
+        _HTTPS_CONTEXT = _https_context()
+    return _HTTPS_CONTEXT
 
 
 BatchProgress = Callable[[int, int], None]
@@ -56,14 +84,29 @@ class Embedder:
     def _post_json(self, url: str, payload: dict) -> dict | list:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST", headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            raise EmbedderError(f"HTTP {exc.code} от {url}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise EmbedderError(f"Недоступен {url}: {exc.reason}") from exc
+        ctx = _context_for(url)
+        kwargs: dict = {"timeout": self.timeout}
+        if ctx is not None:
+            kwargs["context"] = ctx
+        last: EmbedderError | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, **kwargs) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    last = EmbedderError(f"HTTP {exc.code} от {url}: {body}")
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise EmbedderError(f"HTTP {exc.code} от {url}: {body}") from exc
+            except urllib.error.URLError as exc:
+                last = EmbedderError(f"Недоступен {url}: {exc.reason}")
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise last from exc
+        raise last  # pragma: no cover
 
     def _embed_hf(self, texts: list[str]) -> list[list[float]]:
         url = f"{self.base_url}/{self.config.model}/pipeline/feature-extraction"
@@ -189,8 +232,12 @@ class Embedder:
         """Список id моделей (``GET {base}/models``), для дискавери."""
         url = f"{self.base_url}/models"
         req = urllib.request.Request(url, method="GET", headers=self._headers())
+        ctx = _context_for(url)
+        kwargs: dict = {"timeout": self.timeout}
+        if ctx is not None:
+            kwargs["context"] = ctx
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, **kwargs) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             raise EmbedderError(f"models недоступен: {exc}") from exc

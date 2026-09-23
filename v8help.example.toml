@@ -31,11 +31,13 @@ chunk_size = 1500     # целевой размер чанка при разби
 chunk_overlap = 200   # перекрытие соседних чанков
 
 # Эмбеддер для векторного/гибридного поиска (опционально).
+# Модель эмбеддинга ОБЯЗАНА совпадать с моделью, которой построен индекс
+# (готовый индекс собран на bge-m3, 1024 dims).
 # provider: "openai" (по умолчанию) — LM Studio, Ollama и прочие OpenAI-совместимые;
 #           "hf" — Hugging Face Inference native (router.huggingface.co, см. README).
 # [embedder.index]
 # provider = "openai"
-# model = "text-embedding-qwen3-embedding-0.6b"
+# model = "text-embedding-bge-m3"
 # base_url = "http://localhost:1234/v1"
 # api_key = ""
 # dims = 1024
@@ -44,7 +46,7 @@ chunk_overlap = 200   # перекрытие соседних чанков
 
 # [embedder.query]
 # provider = "hf"
-# model = "unsloth/Qwen3-Embedding-0.6B"
+# model = "BAAI/bge-m3"
 # base_url = "https://router.huggingface.co/hf-inference/models"
 # api_key = "<HF_TOKEN>"
 # dims = 1024

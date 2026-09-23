@@ -30,10 +30,12 @@ books = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru", "1cv8_ru"]
 backend = "fts"     # fts | hybrid | vectors
 limit = 10
 
-# Эмбеддер для индексации векторов (опционально, для backend=hybrid/vectors):
+# Эмбеддер для индексации векторов (опционально, для backend=hybrid/vectors).
+# Модель ОБЯЗАНА совпадать с моделью, которой построен индекс: готовый индекс
+# собран на bge-m3 (1024 dims).
 # [embedder.index]
 # provider = "openai"
-# model = "text-embedding-qwen3-embedding-0.6b"
+# model = "text-embedding-bge-m3"
 # base_url = "http://localhost:1234/v1"
 # api_key = ""
 # dims = 1024
@@ -43,10 +45,10 @@ limit = 10
 
 # Эмбеддер для запросов (если не задан — берётся embedder.index):
 # [embedder.query]
-# provider = "openai"
-# model = "text-embedding-qwen3-embedding-0.6b"
-# base_url = "http://localhost:1234/v1"
-# api_key = ""
+# provider = "hf"
+# model = "BAAI/bge-m3"
+# base_url = "https://router.huggingface.co/hf-inference/models"
+# api_key = "<HF_TOKEN>"
 # dims = 1024
 ```
 
@@ -130,3 +132,9 @@ db_path = "C:/path/to/v8help.db"
 
 Поиск (включая векторный, если в БД есть векторы) работает без установленной
 платформы 1С и без эмбеддера на этапе индексации.
+
+Готовый индекс собран моделью **`bge-m3`** (1024 dims). Для гибридного/векторного
+поиска эмбеддер запроса должен быть **той же моделью** — облако Hugging Face
+(`BAAI/bge-m3`, вариант C в [Эмбеддингах](embedding.md)) или локально
+(LM Studio `text-embedding-bge-m3`, Ollama `bge-m3`). Чистый FTS-поиск эмбеддер
+не требует.
