@@ -21,7 +21,7 @@ from typing import Callable
 import numpy as np
 
 from v8help import __version__, lex, metadata
-from v8help.config import Config, discover_platforms
+from v8help.config import Config, _edt_version_of, discover_platforms
 from v8help.converter import consolidate
 from v8help.db import Database
 from v8help.search.chunker import chunk_text
@@ -73,6 +73,16 @@ def _embed_meta_matches(config: Config, meta: dict[str, str]) -> bool:
     )
 
 
+def _edt_meta_matches(config: Config, meta: dict[str, str]) -> bool:
+    """Если CLI 1C:EDT доступен, его версия должна быть записана в meta."""
+    if not getattr(config, "edt_docs", True):
+        return True
+    cli = config.resolve_edt_cli()
+    if cli is None:
+        return True
+    return meta.get("edt_cli_version") == _edt_version_of(cli)
+
+
 def _is_up_to_date(config: Config) -> bool:
     db = Path(config.db_path)
     if not db.exists():
@@ -87,6 +97,8 @@ def _is_up_to_date(config: Config) -> bool:
     try:
         meta = _read_meta(db)
     except Exception:
+        return False
+    if not _edt_meta_matches(config, meta):
         return False
     # Если эмбеддер задан/поменялся — векторы могли устареть; если отключён,
     # а векторы были — пересобрать без них.
@@ -351,6 +363,10 @@ def _build_extra_meta(config: Config, bd: Path) -> dict[str, str]:
         extra["embed_model"] = e.model
         extra["embed_dims"] = str(e.dims)
         extra["embed_chars"] = str(e.embed_chars)
+    if getattr(config, "edt_docs", True):
+        cli = config.resolve_edt_cli()
+        if cli is not None:
+            extra["edt_cli_version"] = _edt_version_of(cli)
     return extra
 
 

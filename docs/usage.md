@@ -32,6 +32,13 @@ v8help build [--sources SRC ...] [--lang ru|en] [--cleanup] [--force]
 | `--chunk-size`   | Целевой размер чанка в символах (по умолчанию 1500)           |
 | `--chunk-overlap`| Перекрытие соседних чанков в символах (по умолчанию 200)      |
 
+Если найден `1cedtcli`, сборка дополнительно пополняет корпус статьями по
+командной строке 1C:EDT (раздел `edt`). Собрать их отдельно:
+
+```bash
+python -m v8help.edtcli --config v8help.toml        # 37 статей в corpus_dir
+```
+
 ### search
 
 Поиск по справке.
@@ -43,7 +50,7 @@ v8help search QUERY [--section SECTION] [--kind KIND] [--limit N]
 | Параметр   | Описание                                                        |
 |------------|-----------------------------------------------------------------|
 | `QUERY`    | Поисковый запрос (обязательный)                                 |
-| `--section`| Фильтр по разделу: `objects`/`tables`/`lang`/`query`/`clang`     |
+| `--section`| Фильтр по разделу: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt` |
 | `--kind`   | Фильтр по kind: `page`/`member`/`index`                          |
 | `--limit`  | Максимум результатов (по умолчанию из `search.limit` конфига)    |
 
@@ -110,7 +117,8 @@ v8help serve [--http] [--host HOST] [--port PORT]
 зависимости от `search.backend`); возвращает чанки с метаданными родителя.
 
 - `query` — поисковый запрос (обязательный);
-- `section` — фильтр: `objects`/`tables`/`lang`/`query`/`clang`;
+- `section` — фильтр: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt`
+  (`edt` — справка по командной строке 1C:EDT);
 - `kind` — фильтр: `page`/`member`/`index`;
 - `limit` — максимум результатов.
 
@@ -128,7 +136,8 @@ v8help serve [--http] [--host HOST] [--port PORT]
 ### hierarchy
 
 `hierarchy(section?)` — оглавление: без `section` — сводка по разделам; с `section` —
-группы страниц раздела с количеством.
+группы страниц раздела с количеством. Разделы: `objects`/`tables`/`lang`/`query`/
+`clang`/`platform`/`edt`.
 
 ### related
 
@@ -157,8 +166,8 @@ v8help serve [--http] [--host HOST] [--port PORT]
 `discover()` — показать конфиг и автодискавери: каталог `bin` установленной
 платформы 1С (реестр Uninstall/ФС на Windows; `/opt/1cv8`, `/usr/lib`,
 `/usr/local` и `PATH` на Linux; на macOS — `/opt/1cv8/<версия>` с бинарями
-без `bin/` плюс ручной фолбэк `/usr/local/opt/1cv8`), доступные эмбеддеры
-на localhost-портах
+без `bin/` плюс ручной фолбэк `/usr/local/opt/1cv8`), установленный 1C:EDT
+(ключ `edt` — путь к `1cedtcli` и версия), доступные эмбеддеры на localhost-портах
 (LM Studio/Ollama) и состояние индекса. В контейнере Docker
 `platforms`/`embedders` обычно пустые — адрес эмбеддера задаётся через
 `embedder.*.base_url` в env/toml и виден в `config` вывода.

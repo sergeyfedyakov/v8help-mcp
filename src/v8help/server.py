@@ -19,7 +19,13 @@ from typing import Any
 from fastmcp import FastMCP
 
 from v8help import __version__
-from v8help.config import Config, config_to_toml, discover_embedders, discover_platforms
+from v8help.config import (
+    Config,
+    config_to_toml,
+    discover_edt,
+    discover_embedders,
+    discover_platforms,
+)
 from v8help.db import Database
 from v8help.jobs import get_manager
 from v8help.search import make_backend
@@ -41,6 +47,8 @@ def _resolve_paths(config: Config, base: Path) -> Config:
         config.corpus_dir = base / config.corpus_dir
     if not config.db_path.is_absolute():
         config.db_path = base / config.db_path
+    if str(config.edt_cli) not in ("", ".") and not config.edt_cli.is_absolute():
+        config.edt_cli = base / config.edt_cli
     return config
 
 
@@ -340,6 +348,7 @@ class _Tools:
             "bin_dir": str(bd) if str(bd) not in ("", ".") else "",
             "bin_dir_explicit": str(self.config.bin_dir) not in ("", "."),
             "platforms": discover_platforms(),
+            "edt": discover_edt(),
             "embedders": discover_embedders(),
             "config": self.config.to_dict(),
             "index": index,
@@ -448,7 +457,7 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
 
         Args:
             query: Поисковый запрос.
-            section: Фильтр по разделу: objects/tables/lang/query/clang/platform.
+            section: Фильтр по разделу: objects/tables/lang/query/clang/platform/edt.
             kind: Фильтр по kind: page/member/index.
             limit: Максимум результатов.
         """
@@ -479,7 +488,7 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
         """Оглавление: без section — сводка по разделам; с section — группы страниц раздела.
 
         Args:
-            section: Раздел для детализации (objects/tables/lang/query/clang/platform).
+            section: Раздел для детализации (objects/tables/lang/query/clang/platform/edt).
         """
         return tools.hierarchy(section=section)
 
@@ -532,8 +541,9 @@ def build_server(config: Config, config_path: str | None = None) -> FastMCP:
     def discover() -> dict:
         """Показать конфиг и автодискавери.
 
-        Каталог bin установленной платформы 1С (реестр Uninstall/ФС), доступные
-        эмбеддеры на localhost-портах (LM Studio/Ollama) и состояние индекса.
+        Каталог bin установленной платформы 1С (реестр Uninstall/ФС), установка
+        1C:EDT CLI (1cedtcli), доступные эмбеддеры на localhost-портах
+        (LM Studio/Ollama) и состояние индекса.
         """
         return tools.discover()
 

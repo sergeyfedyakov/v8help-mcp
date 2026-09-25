@@ -25,15 +25,17 @@ pytest
   - `db.py` — схема SQLite (pages, chunks, links, vectors, meta);
   - `indexer.py` — сборка корпуса, FTS, чанкование, эмбеддинг;
   - `jobs.py` — асинхронные задачи сборки (JobManager, атомарная подмена БД);
+  - `edtcli.py` — справка по командной строке 1C:EDT (`1cedtcli`) → статьи корпуса;
   - `search/` — `fts.py`, `vectors.py`, `hybrid.py` (RRF), `embedder.py`,
     `chunker.py`, `ranking.py`;
-  - `server.py` — MCP-сервер (stdio, JSON-RPC 2.0);
+  - `server.py` — MCP-сервер (FastMCP: stdio / streamable-http);
   - `cli.py` — командная строка.
 - `scripts/` — вспомогательные скрипты:
   - `setup-ollama.ps1` / `setup-ollama.sh` — установка Ollama и модели;
   - `migrate_fts_description.py` — миграция FTS (добавление колонки description);
-  - `add_book_incremental.py` — инкрементальное добавление книги `.hbk` в БД.
-- `tests/` — pytest-тесты.
+  - `add_book_incremental.py` — инкрементальное добавление книги `.hbk` в БД;
+  - `add_docs_incremental.py` — инкрементальный долив произвольных md в готовую БД.
+- `tests/` — pytest-тесты (`conftest.py` глушит реальный дискавери 1C:EDT).
 
 ## Полезные команды
 

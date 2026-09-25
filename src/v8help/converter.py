@@ -623,16 +623,33 @@ class HbkConverter:
 
 # ---------- Консолидация -------------------------------------------------
 
+def _edt_docs(config, on_progress: ProgressFn | None) -> list[Path]:
+    """Статьи по командной строке 1C:EDT (если CLI найден). Сбой не роняет build."""
+    from v8help import edtcli
+
+    try:
+        return edtcli.generate(config, emit=on_progress)
+    except Exception as exc:  # noqa: BLE001 — сборка книг важнее справки EDT
+        if on_progress:
+            on_progress("edtcli", f"Пропуск справки EDT: {type(exc).__name__}: {exc}")
+        return []
+
+
 def consolidate(config, on_progress: ProgressFn | None = None) -> list[Path]:
-    """Генерирует md-корпус из [[sources]]/books в corpus_dir. Идемпотентно."""
+    """Генерирует md-корпус: книги .hbk + справка CLI 1C:EDT. Идемпотентно.
+
+    Без источников (.hbk) корпус НЕ вычищается — это режим индексации уже
+    готового corpus_dir (в тестах и при books=[]); сверху дописывается EDT.
+    """
     sources = config.resolve_sources()
     corpus = config.corpus_dir
     corpus.mkdir(parents=True, exist_ok=True)
-    if not sources:
-        return []
-    # Убираем старые .md, чтобы не оставлять устаревшие страницы.
-    for stale in corpus.glob("*.md"):
-        stale.unlink()
-    converter = HbkConverter(sources, corpus, on_progress)
-    result = converter.run()
-    return result.files
+    files: list[Path] = []
+    if sources:
+        # Убираем старые .md, чтобы не оставлять устаревшие страницы книг.
+        for stale in corpus.glob("*.md"):
+            stale.unlink()
+        converter = HbkConverter(sources, corpus, on_progress)
+        files += converter.run().files
+    files += _edt_docs(config, on_progress)
+    return files

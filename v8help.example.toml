@@ -21,6 +21,12 @@ books = ["shcntx_ru", "shlang_ru", "shquery_ru", "shclang_ru"]
 # prefix = "query__"
 # scheme = "SyntaxHelperQueries"
 
+# Справка по командной строке 1C:EDT (префикс edtcli__, раздел edt).
+# edt_docs = true — при сборке добавить статьи из вывода 1cedtcli, если он найден.
+# edt_cli = "" — явный путь к 1cedtcli; пусто = автодискавери (реестр / известные каталоги).
+# edt_docs = true
+# edt_cli = "C:/Program Files/1C/1CE/components/1c-edt-2026.1.3+25-x86_64/1cedtcli.exe"
+
 [search]
 backend = "fts"     # fts | hybrid | vectors
 limit = 10

@@ -6,13 +6,17 @@ from v8help import config as config_mod
 from v8help.config import (
     Config,
     _bin_dir_for,
+    _edt_cli_in,
     _fs_platform_bin_dirs,
     _is_1c_platform,
+    _is_edt_name,
     _linux_platform_dirs,
     _macos_platform_dirs,
     _parse_dotted_version,
     _parse_version,
     discover_bin_dir,
+    discover_edt,
+    discover_edt_cli,
     discover_embedders,
     discover_platforms,
     reset_discovery_cache,
@@ -105,6 +109,60 @@ def test_resolve_sources_empty_books_no_discovery(monkeypatch):
     cfg = Config()
     cfg.books = []
     assert cfg.resolve_sources() == []
+
+
+def test_is_edt_name():
+    assert _is_edt_name("1C:EDT")
+    assert _is_edt_name("1C:EDT Стартер")
+    assert not _is_edt_name("PostgreSQL 17.5-1.1C(x64)")
+    assert not _is_edt_name("1C:Предприятие 8")
+
+
+def test_edt_cli_in_layouts(tmp_path):
+    name = config_mod._EDT_CLI_NAMES[0]
+    root = tmp_path / "1c-edt-2026.1.3+25-x86_64"
+    root.mkdir()
+    (root / name).write_bytes(b"x")
+    assert _edt_cli_in(root) == root / name
+    nested = tmp_path / "1C_EDT 2026.1"
+    (nested / "1cedt").mkdir(parents=True)
+    (nested / "1cedt" / name).write_bytes(b"x")
+    assert _edt_cli_in(nested) == nested / "1cedt" / name
+
+
+def test_discover_edt_picks_highest(tmp_path, monkeypatch):
+    name = config_mod._EDT_CLI_NAMES[0]
+    old = tmp_path / "1c-edt-2025.1.0+1-x86_64"
+    old.mkdir()
+    (old / name).write_bytes(b"x")
+    new = tmp_path / "1c-edt-2026.1.3+25-x86_64"
+    new.mkdir()
+    (new / name).write_bytes(b"x")
+    monkeypatch.setattr(config_mod, "_edt_registry_dirs", lambda: [])
+    monkeypatch.setattr(config_mod, "_edt_fs_dirs", lambda: [old, new])
+    reset_discovery_cache()
+    assert discover_edt_cli() == new / name
+    found = discover_edt()
+    assert found["found"] is True
+    assert found["version"] == "2026.1.3"
+
+
+def test_discover_edt_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_edt_registry_dirs", lambda: [])
+    monkeypatch.setattr(config_mod, "_edt_fs_dirs", lambda: [tmp_path / "none"])
+    reset_discovery_cache()
+    assert discover_edt_cli() is None
+    assert discover_edt() == {"found": False, "cli": "", "version": ""}
+
+
+def test_discover_edt_explicit_config(tmp_path):
+    cli = tmp_path / config_mod._EDT_CLI_NAMES[0]
+    cli.write_bytes(b"x")
+    cfg = Config()
+    cfg.edt_cli = cli
+    assert cfg.resolve_edt_cli() == cli
+    cfg.edt_cli = tmp_path / "missing.exe"
+    assert cfg.resolve_edt_cli() is None
 
 
 def test_discover_embedders_tolerates_null_data(monkeypatch):

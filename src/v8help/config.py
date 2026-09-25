@@ -70,6 +70,8 @@ class Config:
     sources: list[SourceSpec] = field(default_factory=list)
     lang: str = "ru"
     include_english: bool = False
+    edt_cli: Path = Path("")
+    edt_docs: bool = True
     embedder_index: EmbedderConfig = field(default_factory=EmbedderConfig)
     embedder_query: EmbedderConfig = field(default_factory=EmbedderConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
@@ -89,18 +91,7 @@ class Config:
     @classmethod
     def from_dict(cls, data: dict) -> Config:
         cfg = cls()
-        if "corpus_dir" in data:
-            cfg.corpus_dir = Path(data["corpus_dir"])
-        if "db_path" in data:
-            cfg.db_path = Path(data["db_path"])
-        if "bin_dir" in data:
-            cfg.bin_dir = Path(data["bin_dir"])
-        if "books" in data:
-            cfg.books = list(data["books"])
-        if "lang" in data:
-            cfg.lang = str(data["lang"])
-        if "include_english" in data:
-            cfg.include_english = bool(data["include_english"])
+        _apply_basic(cfg, data)
         cfg.sources = _sources_from(data, cfg.lang)
         embedder = data.get("embedder") or {}
         cfg.embedder_index = _embedder(embedder.get("index") or {})
@@ -115,6 +106,13 @@ class Config:
         if str(self.bin_dir) not in ("", "."):
             return self.bin_dir
         return discover_bin_dir() or Path("")
+
+    def resolve_edt_cli(self) -> Path | None:
+        """CLI 1C:EDT: явный ``edt_cli`` либо автодискавери; None, если не найден."""
+        if str(self.edt_cli) not in ("", "."):
+            p = Path(self.edt_cli)
+            return p if p.is_file() else None
+        return discover_edt_cli()
 
     def resolve_sources(self, lang: str | None = None) -> list[SourceSpec]:
         """Источники для сборки: явный [[sources]] либо books+bin_dir (shorthand)."""
@@ -137,6 +135,8 @@ class Config:
             "lang": self.lang,
             "books": list(self.books),
             "include_english": self.include_english,
+            "edt_cli": str(self.edt_cli) if str(self.edt_cli) not in ("", ".") else "",
+            "edt_docs": self.edt_docs,
             "search": _search_dict(self.search),
             "build": _build_dict(self.build),
             "embedder": {
@@ -147,6 +147,26 @@ class Config:
         if self.sources:
             d["sources"] = [_source_dict(s) for s in self.sources]
         return d
+
+
+def _apply_basic(cfg: Config, data: dict) -> None:
+    """Простые скалярные/списковые поля конфига (без вложенных секций)."""
+    if "corpus_dir" in data:
+        cfg.corpus_dir = Path(data["corpus_dir"])
+    if "db_path" in data:
+        cfg.db_path = Path(data["db_path"])
+    if "bin_dir" in data:
+        cfg.bin_dir = Path(data["bin_dir"])
+    if "books" in data:
+        cfg.books = list(data["books"])
+    if "lang" in data:
+        cfg.lang = str(data["lang"])
+    if "include_english" in data:
+        cfg.include_english = bool(data["include_english"])
+    if "edt_cli" in data:
+        cfg.edt_cli = Path(str(data["edt_cli"]))
+    if "edt_docs" in data:
+        cfg.edt_docs = bool(data["edt_docs"])
 
 
 def _embedder(data: dict) -> EmbedderConfig:
@@ -269,6 +289,8 @@ _ENV_SCALARS = {
     "V8HELP_LANG": ("lang", "str"),
     "V8HELP_BOOKS": ("books", "books"),
     "V8HELP_INCLUDE_ENGLISH": ("include_english", "bool"),
+    "V8HELP_EDT_CLI": ("edt_cli", "path"),
+    "V8HELP_EDT_DOCS": ("edt_docs", "bool"),
     "V8HELP_BACKEND": ("search.backend", "str"),
     "V8HELP_LIMIT": ("search.limit", "int"),
     "V8HELP_MAX_CHUNKS_PER_PAGE": ("search.max_chunks_per_page", "int"),
@@ -615,9 +637,10 @@ def discover_bin_dir() -> Path | None:
 
 
 def reset_discovery_cache() -> None:
-    global _bin_dir_cache, _embedders_cache
+    global _bin_dir_cache, _embedders_cache, _edt_cli_cache
     _bin_dir_cache = (False, None)
     _embedders_cache = (False, [])
+    _edt_cli_cache = (False, None)
 
 
 # ---------- Дискавери эмбеддеров (OpenAI-совместимые /v1/models) -------------
@@ -667,6 +690,109 @@ def discover_embedders(timeout: float = 0.8) -> list[dict]:
             )
     _embedders_cache = (True, out)
     return out
+
+
+# ---------- Автодискавери 1C:EDT CLI ----------------------------------------
+
+_EDT_CLI_NAMES = ("1cedtcli.exe", "1cedtcli") if os.name == "nt" else ("1cedtcli",)
+
+_edt_cli_cache: tuple[bool, Path | None] = (False, None)
+
+
+def _edt_cli_in(loc: Path) -> Path | None:
+    """1cedtcli в каталоге установки EDT (в корне или в подкаталоге ``1cedt``)."""
+    for name in _EDT_CLI_NAMES:
+        for cand in (loc / name, loc / "1cedt" / name):
+            try:
+                if cand.is_file():
+                    return cand
+            except OSError:
+                continue
+    return None
+
+
+def _is_edt_name(display_name: str) -> bool:
+    low = display_name.casefold()
+    has_edt = "edt" in low or "development tools" in low
+    return has_edt and ("1c" in low or "1с" in low)
+
+
+def _edt_registry_dirs() -> list[Path]:
+    """Каталоги установок EDT из реестра Uninstall (HKLM/WOW6432Node/HKCU)."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    roots = (
+        (winreg.HKEY_LOCAL_MACHINE, _UNINSTALL_SUB),
+        (winreg.HKEY_LOCAL_MACHINE, _UNINSTALL_WOW_SUB),
+        (winreg.HKEY_CURRENT_USER, _UNINSTALL_SUB),
+    )
+    out: list[Path] = []
+    for hive, sub in roots:
+        for dn, _ver, loc in _uninstall_entries(winreg, hive, sub):
+            if loc and _is_edt_name(dn):
+                out.append(Path(loc))
+    return out
+
+
+def _edt_fs_dirs() -> list[Path]:
+    """Известные раскладки установок EDT (компоненты 1C:EDT / 1cedtstart)."""
+    roots: list[Path] = []
+    prog = os.environ.get("PROGRAMFILES")
+    if prog:
+        roots.append(Path(prog) / "1C" / "1CE" / "components")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "1C" / "1cedtstart" / "installations")
+    roots += [Path("/Applications/1C/1CE/components"), Path("/opt/1C/1CE/components")]
+    out: list[Path] = []
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            out += [c for c in root.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+    return out
+
+
+def discover_edt(force: bool = False) -> dict:
+    """Найденная установка 1C:EDT CLI: ``{found, cli, version}`` (кешируется)."""
+    cli = discover_edt_cli(force=force)
+    if cli is None:
+        return {"found": False, "cli": "", "version": ""}
+    ver = _edt_version_of(cli)
+    return {"found": True, "cli": str(cli), "version": ver}
+
+
+def discover_edt_cli(force: bool = False) -> Path | None:
+    """Путь к самому свежему ``1cedtcli`` или None. Результат кешируется."""
+    global _edt_cli_cache
+    done, val = _edt_cli_cache
+    if done and not force:
+        return val
+    cands: list[tuple[tuple[int, ...], Path]] = []
+    seen: set[Path] = set()
+    for loc in _edt_registry_dirs() + _edt_fs_dirs():
+        cli = _edt_cli_in(loc)
+        if cli is None or cli in seen:
+            continue
+        seen.add(cli)
+        ver = _parse_dotted_version(loc.name) or (0,)
+        cands.append((ver, cli))
+    val = max(cands, key=lambda x: x[0])[1] if cands else None
+    _edt_cli_cache = (True, val)
+    return val
+
+
+def _edt_version_of(cli: Path) -> str:
+    """Версия EDT из имени каталога установки (для мета и пересборки)."""
+    for p in (cli.parent, cli.parent.parent):
+        v = _parse_dotted_version(p.name)
+        if v:
+            return ".".join(map(str, v))
+    return ""
 
 
 # ---------- Минимальный TOML-сериализатор (для config_set) -------------------

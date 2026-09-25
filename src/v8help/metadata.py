@@ -12,6 +12,7 @@ _SECTION_BY_PREFIX = (
     ("clang__", "clang"),
     ("dcsui__", "objects"),
     ("1cv8__", "platform"),
+    ("edtcli__", "edt"),
 )
 
 _SCHEME_PREFIX = {
@@ -45,6 +46,8 @@ def detect_source(filename: str) -> str:
         return "dcsui_ru"
     if filename.startswith("1cv8__"):
         return "1cv8_ru"
+    if filename.startswith("edtcli__"):
+        return "edtcli"
     return "shcntx_ru"
 
 
