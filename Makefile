@@ -1,4 +1,4 @@
-IMAGE ?= v8help:0.10.0
+IMAGE ?= v8help:0.14.0
 CONTAINER ?= v8help
 PORT ?= 8000
 DATA_DIR ?= ./data

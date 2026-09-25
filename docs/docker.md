@@ -21,7 +21,7 @@
 ## Сборка образа
 
 ```bash
-docker build -t v8help:0.10.0 .
+docker build -t v8help:0.14.0 .
 ```
 
 `Makefile` (Linux): `make build`, `make run`, `make test`, `make stop`,
@@ -34,7 +34,7 @@ mkdir -p ./data && sudo chown 1000:1000 ./data   # Linux: права на зап
 docker run -d --name v8help \
     -p 8000:8000 \
     -v ./data:/data \
-    v8help:0.10.0
+    v8help:0.14.0
 ```
 
 Только это и нужно для работы: порт 8000 и каталог с БД. При первом старте в
@@ -69,7 +69,7 @@ docker run -d --name v8help \
     --add-host host.docker.internal:host-gateway \
     -e V8HELP_EMBEDDER_QUERY_BASE_URL=http://host.docker.internal:11434/v1 \
     -e V8HELP_SEARCH_BACKEND=hybrid \
-    v8help:0.10.0
+    v8help:0.14.0
 ```
 
 - `--add-host host.docker.internal:host-gateway` — на Linux-движке даёт доступ к
@@ -94,7 +94,7 @@ docker run --rm \
     -v ./data:/data \
     -v /opt/1cv8:/opt/1cv8:ro \
     -e V8HELP_INIT_DB=false \
-    v8help:0.10.0 v8help build --force
+    v8help:0.14.0 v8help build --force
 ```
 
 - `-e V8HELP_INIT_DB=false` — **ключ инита**: отключаем автозагрузку готовой БД
@@ -109,7 +109,7 @@ docker run --rm \
 После сборки запустите сервер с тем же каталогом:
 
 ```bash
-docker run -d --name v8help -p 8000:8000 -v ./data:/data v8help:0.10.0
+docker run -d --name v8help -p 8000:8000 -v ./data:/data v8help:0.14.0
 ```
 
 ## Переменные окружения
@@ -130,7 +130,7 @@ docker run -d --name v8help -p 8000:8000 -v ./data:/data v8help:0.10.0
 ## Тесты в контейнере
 
 ```bash
-docker run --rm --entrypoint python v8help:0.10.0 -m pytest /app/tests -q
+docker run --rm --entrypoint python v8help:0.14.0 -m pytest /app/tests -q
 ```
 
 ## MCP-клиент (Kilo)
