@@ -26,6 +26,7 @@ pytest
   - `indexer.py` — сборка корпуса, FTS, чанкование, эмбеддинг;
   - `jobs.py` — асинхронные задачи сборки (JobManager, атомарная подмена БД);
   - `edtcli.py` — справка по командной строке 1C:EDT (`1cedtcli`) → статьи корпуса;
+  - `v8cli.py` — справка по CLI-утилитам платформы (`rac`/`ibcmd`/`ibsrv`/`webinst`) → статьи корпуса;
   - `search/` — `fts.py`, `vectors.py`, `hybrid.py` (RRF), `embedder.py`,
     `chunker.py`, `ranking.py`;
   - `server.py` — MCP-сервер (FastMCP: stdio / streamable-http);

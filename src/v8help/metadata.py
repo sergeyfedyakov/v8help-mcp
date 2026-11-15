@@ -13,6 +13,7 @@ _SECTION_BY_PREFIX = (
     ("dcsui__", "objects"),
     ("1cv8__", "platform"),
     ("edtcli__", "edt"),
+    ("v8cli__", "tools"),
 )
 
 _SCHEME_PREFIX = {
@@ -48,6 +49,8 @@ def detect_source(filename: str) -> str:
         return "1cv8_ru"
     if filename.startswith("edtcli__"):
         return "edtcli"
+    if filename.startswith("v8cli__"):
+        return "v8cli"
     return "shcntx_ru"
 
 

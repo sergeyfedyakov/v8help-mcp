@@ -39,6 +39,13 @@ v8help build [--sources SRC ...] [--lang ru|en] [--cleanup] [--force]
 python -m v8help.edtcli --config v8help.toml        # 37 статей в corpus_dir
 ```
 
+Справка по CLI-утилитам платформы (`rac`/`ibcmd`/`ibsrv`/`webinst`, раздел
+`tools`) снимается с вывода самих утилит (компоненты 8.3.x) отдельно:
+
+```bash
+python -m v8help.v8cli --config v8help.toml         # 31 статья в corpus_dir
+```
+
 ### search
 
 Поиск по справке.
@@ -50,7 +57,7 @@ v8help search QUERY [--section SECTION] [--kind KIND] [--limit N]
 | Параметр   | Описание                                                        |
 |------------|-----------------------------------------------------------------|
 | `QUERY`    | Поисковый запрос (обязательный)                                 |
-| `--section`| Фильтр по разделу: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt` |
+| `--section`| Фильтр по разделу: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt`/`tools` |
 | `--kind`   | Фильтр по kind: `page`/`member`/`index`                          |
 | `--limit`  | Максимум результатов (по умолчанию из `search.limit` конфига)    |
 
@@ -117,8 +124,8 @@ v8help serve [--http] [--host HOST] [--port PORT]
 зависимости от `search.backend`); возвращает чанки с метаданными родителя.
 
 - `query` — поисковый запрос (обязательный);
-- `section` — фильтр: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt`
-  (`edt` — справка по командной строке 1C:EDT);
+- `section` — фильтр: `objects`/`tables`/`lang`/`query`/`clang`/`platform`/`edt`/`tools`
+  (`edt` — справка по командной строке 1C:EDT, `tools` — CLI-утилиты платформы);
 - `kind` — фильтр: `page`/`member`/`index`;
 - `limit` — максимум результатов.
 
@@ -137,7 +144,7 @@ v8help serve [--http] [--host HOST] [--port PORT]
 
 `hierarchy(section?)` — оглавление: без `section` — сводка по разделам; с `section` —
 группы страниц раздела с количеством. Разделы: `objects`/`tables`/`lang`/`query`/
-`clang`/`platform`/`edt`.
+`clang`/`platform`/`edt`/`tools`.
 
 ### related
 
